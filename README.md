@@ -46,7 +46,7 @@ A different **Windows** look for **Ace Step 1.5** 🪟✨
   - 🧰 Other features like **cover**, **repaint**, etc. are available under **Advanced settings** (mostly untested)
 - 🔍 Auto-checks for repo, environment, models, CLI, etc. at startup  
   - ♻️ If you already have models/LM's downloaded, you can copy them and re-use them
-- 🕒 **Last results** (double click to play)
+- 🕒 **results box** with preview panel keeps all results you created (double click a result to update/play)
 - 🏷️ Auto rename results (**genre - seed - date.mp3**)
 - 🧊 Offload options (needs testing on -16GB VRAM cards)
 - 🧾 Logger
