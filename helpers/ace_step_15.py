@@ -1050,17 +1050,49 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 
-        # One scrollable page (simple UI + Advanced Settings)
+        # Tabs: Create / Advanced
+        self.tabs = QtWidgets.QTabWidget()
+        outer.addWidget(self.tabs, 1)
+
+        # -------------------------
+        # Tab 1: Create (scrollable)
+        # -------------------------
+        tab_create = QtWidgets.QWidget()
+        self.tabs.addTab(tab_create, "Create")
+        tab_create_l = QtWidgets.QVBoxLayout(tab_create)
+        tab_create_l.setContentsMargins(0, 0, 0, 0)
+        tab_create_l.setSpacing(0)
+
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll, 1)
+        tab_create_l.addWidget(scroll, 1)
 
         page = QtWidgets.QWidget()
         scroll.setWidget(page)
         page_l = QtWidgets.QVBoxLayout(page)
         page_l.setContentsMargins(12, 12, 12, 12)
         page_l.setSpacing(12)
+
+        # -------------------------
+        # Tab 2: Advanced (scrollable)
+        # -------------------------
+        tab_adv = QtWidgets.QWidget()
+        self.tabs.addTab(tab_adv, "Advanced")
+        tab_adv_l = QtWidgets.QVBoxLayout(tab_adv)
+        tab_adv_l.setContentsMargins(0, 0, 0, 0)
+        tab_adv_l.setSpacing(0)
+
+        adv_scroll = QtWidgets.QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        tab_adv_l.addWidget(adv_scroll, 1)
+
+        adv_page = QtWidgets.QWidget()
+        adv_scroll.setWidget(adv_page)
+        adv_page_l = QtWidgets.QVBoxLayout(adv_page)
+        adv_page_l.setContentsMargins(12, 12, 12, 12)
+        adv_page_l.setSpacing(12)
 
         # -------------------------
         # Simple UI (always visible)
@@ -1537,27 +1569,12 @@ class MainWindow(QtWidgets.QMainWindow):
         page_l.addWidget(gb_recent, 0)
 
         # -------------------------
-        # Advanced Settings (collapsed)
+        # Advanced Settings (moved to Advanced tab)
         # -------------------------
-        self.adv_main_toggle = QtWidgets.QToolButton()
-        self.adv_main_toggle.setText("Advanced Settings")
-        self.adv_main_toggle.setCheckable(True)
-        self.adv_main_toggle.setChecked(False)
-        self.adv_main_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.adv_main_toggle.setArrowType(QtCore.Qt.RightArrow)
-        page_l.addWidget(self.adv_main_toggle, 0, QtCore.Qt.AlignLeft)
-
         self.adv_main_widget = QtWidgets.QWidget()
         adv_l = QtWidgets.QVBoxLayout(self.adv_main_widget)
         adv_l.setContentsMargins(0, 0, 0, 0)
         adv_l.setSpacing(12)
-        self.adv_main_widget.setVisible(False)
-
-        def _toggle_adv_main(on: bool):
-            self.adv_main_widget.setVisible(on)
-            self.adv_main_toggle.setArrowType(QtCore.Qt.DownArrow if on else QtCore.Qt.RightArrow)
-
-        self.adv_main_toggle.toggled.connect(_toggle_adv_main)
 
         # Section 1: Task / Inputs
         gb_task = QtWidgets.QGroupBox("Task & Inputs")
@@ -1726,7 +1743,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         adv_l.addStretch(1)
 
-        page_l.addWidget(self.adv_main_widget, 0)
+        adv_page_l.addWidget(self.adv_main_widget, 0)
 
         # Menu
         m = self.menuBar()        
