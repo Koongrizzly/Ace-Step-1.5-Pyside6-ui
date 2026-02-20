@@ -3635,16 +3635,20 @@ class MainWindow(QtWidgets.QMainWindow):
             mb.exec_()
             return
 
-        mb = QtWidgets.QMessageBox(self)
-        mb.setWindowTitle("Update")
-        mb.setIcon(QtWidgets.QMessageBox.Question)
-        mb.setText(f"{len(changed)} new/changed files found. Apply Update?")
-        mb.setInformativeText("The app needs restart after applying updates.")
-        mb.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-        mb.setDefaultButton(QtWidgets.QMessageBox.Yes)
-        resp = mb.exec_()
-        if resp != QtWidgets.QMessageBox.Yes:
+        selected = self._update_pick_files_dialog(changed)
+        if selected is None:
             return
+        if not selected:
+            mb = QtWidgets.QMessageBox(self)
+            mb.setWindowTitle("Update")
+            mb.setIcon(QtWidgets.QMessageBox.Information)
+            mb.setText("No files selected")
+            mb.setInformativeText("The app needs restart after applying updates.")
+            mb.setStandardButtons(QtWidgets.QMessageBox.Ok)
+            mb.exec_()
+            return
+
+        changed = selected
 
         try:
             self._update_apply_files(changed)
@@ -3659,6 +3663,69 @@ class MainWindow(QtWidgets.QMainWindow):
         done.setInformativeText("The app needs restart after applying updates.")
         done.setStandardButtons(QtWidgets.QMessageBox.Ok)
         done.exec_()
+
+
+    def _update_pick_files_dialog(self, changed_items):
+        """Let the user select which changed items to apply. Returns a list (subset) or None if cancelled."""
+        try:
+            from PySide6 import QtCore, QtWidgets
+        except Exception:
+            # Fallback: apply all
+            return changed_items
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Update")
+        dlg.setModal(True)
+
+        v = QtWidgets.QVBoxLayout(dlg)
+
+        title = QtWidgets.QLabel(f"{len(changed_items)} new/changed files found. Select which files to apply:")
+        title.setWordWrap(True)
+        v.addWidget(title)
+
+        info = QtWidgets.QLabel("The app needs restart after applying updates.")
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        lst = QtWidgets.QListWidget()
+        lst.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        v.addWidget(lst, 1)
+
+        # Keep original items addressable by index
+        for i, it in enumerate(changed_items):
+            rel = it.get("rel_path", "")
+            tag = "NEW" if it.get("is_new") else "CHANGED"
+            witem = QtWidgets.QListWidgetItem(f"[{tag}] {rel}")
+            witem.setFlags(witem.flags() | QtCore.Qt.ItemIsUserCheckable)
+            witem.setCheckState(QtCore.Qt.Checked)
+            witem.setData(QtCore.Qt.UserRole, i)
+            lst.addItem(witem)
+
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        ok = bb.button(QtWidgets.QDialogButtonBox.Ok)
+        if ok is not None:
+            ok.setText("Apply Update")
+        cancel = bb.button(QtWidgets.QDialogButtonBox.Cancel)
+        if cancel is not None:
+            cancel.setText("Cancel")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+
+        dlg.resize(720, 420)
+
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+
+        selected = []
+        for row in range(lst.count()):
+            witem = lst.item(row)
+            if witem.checkState() == QtCore.Qt.Checked:
+                idx = witem.data(QtCore.Qt.UserRole)
+                if isinstance(idx, int) and 0 <= idx < len(changed_items):
+                    selected.append(changed_items[idx])
+
+        return selected
 
     def _update_check_github_repo(self):
         """Return a list of update items: dict(rel_path, data, is_new, is_changed)."""
@@ -3676,7 +3743,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return []
         root = names[0].split('/', 1)[0] + '/'
 
-        base_dir = os.path.dirname(os.path.abspath(sys.argv[0] or __file__))
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # If this file lives in a /helpers folder, project root is one level up.
+        if os.path.basename(base_dir).lower() == 'helpers':
+            base_dir = os.path.abspath(os.path.join(base_dir, '..'))
+
 
         def _ignore(rel):
             rel = rel.replace('\\', '/')
@@ -3719,7 +3790,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_apply_files(self, changed_items):
         import shutil, datetime
 
-        base_dir = os.path.dirname(os.path.abspath(sys.argv[0] or __file__))
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        # If this file lives in a /helpers folder, project root is one level up.
+        if os.path.basename(base_dir).lower() == 'helpers':
+            base_dir = os.path.abspath(os.path.join(base_dir, '..'))
+
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         backup_dir = os.path.join(base_dir, f"_update_backup_{stamp}")
         os.makedirs(backup_dir, exist_ok=True)
