@@ -25,11 +25,11 @@ All credits to & original model here : https://github.com/ace-step/ACE-Step-1.5
 - Tooltips, 'auto', 'let Ace decide' and other helpful defaults for easy first time use.
 - Wheelguard on/off (allow changes while scrolling on/off)
 - 'Fancy banner' on/off
-- 25 themes (imported from my other app, not all look good or make a lot of change in this standalone version)
-- Genre preset manager (add/edit/delete,..) comes with 60+ example presets, all presets are saved with thinking on + SFT model + 1.7B Lm, this may require extra vram, use an editor such as notepad++ to replace all models in the .json file at once with a lower (turbo and 0.6B) model/Lm when needed. Most things get saved , duration and a couple more that need change a lot don't.
-Gow to add a preset ? It wll first ask for the main genre (eg 'Rock', next it asks for the subgenre (eg. 'metal') If you it already exists it will be overwritten (case sensitive)
+- 25 themes (imported from my Framevision app, not all Themes look good or make a lot of change in this standalone version)
+- Genre preset manager (add/edit/delete,..) comes with 60+ example presets, all presets are saved with thinking on + SFT model + 1.7B Lm for best results, this takes a lot longer and may require extra vram, use an editor such as notepad++ to replace all models in the .json file at once with a lower (turbo and 0.6B) model/Lm when needed. 
+How to add a preset ? It wll first ask for the main genre (eg 'Rock', next it asks for the subgenre (eg. 'metal') If you it already exists it will be overwritten.
 - Mostly build around the text to music feature, all (most) main settings and toggles available.
-  However all other features such as cover, repaint,.. are also available in the 'advanced settings' (but mostly untested)
+  All other features such as cover, repaint,.. are also available in the 'advanced settings' (but mostly untested)
 - Auto checks for repo, environment and models, cli,... at startup, if you already have all models downloaded, you can simply copy them and re use them (models\ace_step_15\repo\ACE-Step-1.5\checkpoints)
 - Last results (double click to play)
 - Random seed toggle (shows seed used instead of -1)
