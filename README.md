@@ -1,5 +1,5 @@
 # 🎛️ Ace-Step 1.5 PySide6 UI
-A different **Windows** look for **Ace Step 1.5** 🪟✨
+A different **(Windows)** look for **Ace Step 1.5** 🪟✨
 
 <p align="center">
 
