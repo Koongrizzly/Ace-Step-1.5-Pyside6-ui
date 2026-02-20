@@ -1389,27 +1389,6 @@
           "lm_model": "acestep-5HZ-lm-1.7B",
           "lm_model_path": "acestep-5HZ-lm-1.7B"
         },
-        "Metal": {
-          "backend": "vllm",
-          "device": "auto",
-          "caption": "High-energy metal track at 150 BPM, 4/4. Aggressive distorted guitars with tight palm-muted riffs, fast double-kick drums, sharp snare, and powerful bass following the riff. Vocals are intense (shouted or gritty), delivering defiant, adrenaline-fueled lines. Clear modern punch but still raw: strong rhythm precision, big chorus impact, and fast breakdown-style sections without EDM elements.",
-          "time_sig": "auto",
-          "thinking": true,
-          "use_cot_caption": true,
-          "use_cot_language": true,
-          "use_cot_metas": true,
-          "instrumental": false,
-          "use_cot_lyrics": false,
-          "lm_negative_prompt": "pop sparkle, autotune R&B runs, reggae groove, jazz swing, orchestral waltz, tropical house, dubstep drops, lo-fi chill",
-          "bpm": 150,
-          "enable_lm": true,
-          "parallel_thinking": true,
-          "lm_enhance_prompt": true,
-          "main_model": "acestep-v15-sft",
-          "main_model_path": "acestep-v15-sft",
-          "lm_model": "acestep-5HZ-lm-1.7B",
-          "lm_model_path": "acestep-5HZ-lm-1.7B"
-        },
         "Funk": {
           "backend": "vllm",
           "device": "auto",
