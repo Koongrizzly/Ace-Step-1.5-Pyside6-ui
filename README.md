@@ -32,7 +32,7 @@ A different **Windows** look for **Ace Step 1.5** 🪟✨
 ---
 
 ## ✨ Features
-- 🧠 Tooltips, **Auto**, **Let Ace decide**, and helpful defaults for easy first-time use
+- 🧠 Tooltips, **Auto**, **Let Ace decide**, and other helpful defaults for easy first-time use
 - 🖱️🛡️ **Wheelguard** on/off (allow changes while scrolling on/off)
 - 🏷️ **Fancy banner** on/off
 - 🎨 **25 themes** (imported from my other app — not all look good / change much in this standalone version)
