@@ -1,11 +1,4 @@
 # 🎛️ Ace-Step 1.5 Pyside6 ui
----
-
-## Screenshots
-
-| Screenshot 1                          | Screenshot 2                        | Screenshot 3                         | Preset Manager                             |
-|----------------------------------------|----------------------------------------|----------------------------------------|----------------------------------------|
-| ![Music Creator](assets/screenshot1.jpg) | ![Music Creator 2](assets/screenshot2.jpg) | ![Preset Manager](assets/screenshot3.jpg) | ![Other view](assets/manager.jpg) |
 
 ---
 
@@ -51,3 +44,10 @@ Gow to add a preset ? It wll first ask for the main genre (eg 'Rock', next it as
 - toggle to keep the model in vram for faster generation
 - try to fix flash & nano-vllm when i find the time
 - Add more functions /updates
+
+
+## Screenshots
+
+| Screenshot 1                          | Screenshot 2                        | Screenshot 3                         | Preset Manager                             |
+|----------------------------------------|----------------------------------------|----------------------------------------|----------------------------------------|
+| ![Music Creator](assets/screenshot1.jpg) | ![Music Creator 2](assets/screenshot2.jpg) | ![Preset Manager](assets/screenshot3.jpg) | ![Other view](assets/manager.jpg) |
