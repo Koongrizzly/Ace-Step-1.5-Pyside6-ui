@@ -807,6 +807,7 @@ class Settings:
     seed: int = -1
 
 
+    seed_random: bool = False
     bpm: int = 0  # 0 = auto
     timesignature: int = 0  # 0 = auto
     keyscale: str = ""  # empty = auto
