@@ -32,6 +32,7 @@ Gow to add a preset ? It wll first ask for the main genre (eg 'Rock', next it as
   However all other features such as cover, repaint,.. are also available in the 'advanced settings' (but mostly untested)
 - Auto checks for repo, environment and models, cli,... at startup, if you already have all models downloaded, you can simply copy them and re use them (models\ace_step_15\repo\ACE-Step-1.5\checkpoints)
 - Last results (double click to play)
+- Random seed toggle (shows seed used instead of -1)
 - Auto rename results (genre - seed - date . mp3)
 - Offload options (needs testing on -16 gig vram cards)
 - logger
