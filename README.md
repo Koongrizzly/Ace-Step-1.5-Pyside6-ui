@@ -3,9 +3,9 @@
 
 ## Screenshots
 
-| Music Creator                          | Music Creator 2                        | Preset Manager                         | Other view                             |
+| Screenshot 1                          | Screenshot 2                        | Screenshot 3                         | Preset Manager                             |
 |----------------------------------------|----------------------------------------|----------------------------------------|----------------------------------------|
-| ![Music Creator](assets/2026-02-20-04_15_05-Ace-Step-1.5-—-Music-Creator.jpg) | ![Music Creator 2](assets/2026-02-20-04_15_52-Ace-Step-1.5-—-Music-Creator.jpg) | ![Preset Manager](assets/2026-02-20-04_17_04-Ace-Step-1.5-—-Preset-Manager.jpg) | ![Other view](assets/2026-02-20-04_16_28.jpg) |
+| ![Music Creator](assets/screenshot1.jpg) | ![Music Creator 2](assets/screenshot2.jpg) | ![Preset Manager](assets/screenshot3.jpg) | ![Other view](assets/manager.jpg) |
 
 ---
 
