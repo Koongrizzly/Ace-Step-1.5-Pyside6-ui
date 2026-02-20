@@ -22,7 +22,7 @@ All credits to & original model here : https://github.com/ace-step/ACE-Step-1.5
 - Tooltips, 'auto', 'let Ace decide' and other helpful defaults for easy first time use.
 - Wheelguard on/off (allow changes while scrolling on/off)
 - 'Fancy banner' on/off
-- 25 themes (imported from my other app,not all look good or make a lot of change in this standalone version)
+- 25 themes (imported from my other app, not all look good or make a lot of change in this standalone version)
 - Genre preset manager (add/edit/delete,..) comes with 60+ example presets, all presets are saved with thinking on + SFT model + 1.7B Lm, this may require extra vram, use an editor such as notepad++ to replace all models in the .json file at once with a lower (turbo and 0.6B) model/Lm when needed. Most things get saved , duration and a couple more that nedd change a lot don't.
 - Mostly build around the text to music feature, all (most) main settings and toggles available.
   However all other features such as cover, repaint,.. are also available in the 'advanced settings' (but mostly untested)
