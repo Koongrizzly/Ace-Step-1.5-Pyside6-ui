@@ -1,15 +1,12 @@
 # 🎛️ Ace-Step 1.5 Pyside6 ui
 ---
-A different (Windows) look for Ace Step 1.5
 
 ## Screenshots
 
-<div style="display: flex; flex-wrap: wrap; gap: 16px;">
-  <img src="assets/2026-02-20-04_15_05-Ace-Step-1.5-—-Music-Creator.jpg" width="400" alt="Music Creator"/>
-  <img src="assets/2026-02-20-04_15_52-Ace-Step-1.5-—-Music-Creator.jpg" width="400" alt="Music Creator 2"/>
-  <img src="assets/2026-02-20-04_17_04-Ace-Step-1.5-—-Preset-Manager.jpg" width="400" alt="Preset Manager"/>
-  <img src="assets/2026-02-20-04_16_28.jpg" width="400" alt="Other view"/>
-</div>
+| Music Creator                          | Music Creator 2                        | Preset Manager                         | Other view                             |
+|----------------------------------------|----------------------------------------|----------------------------------------|----------------------------------------|
+| ![Music Creator](assets/2026-02-20-04_15_05-Ace-Step-1.5-—-Music-Creator.jpg) | ![Music Creator 2](assets/2026-02-20-04_15_52-Ace-Step-1.5-—-Music-Creator.jpg) | ![Preset Manager](assets/2026-02-20-04_17_04-Ace-Step-1.5-—-Preset-Manager.jpg) | ![Other view](assets/2026-02-20-04_16_28.jpg) |
+
 ---
 
 | 🔎 Quick links | |
