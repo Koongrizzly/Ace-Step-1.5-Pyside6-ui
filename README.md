@@ -45,11 +45,12 @@ A different **Windows** look for **Ace Step 1.5** 🪟✨
 - 🎵 Mostly built around **Text → Music** (most main settings + toggles available)
   - 🧰 Other features like **cover**, **repaint**, etc. are available under **Advanced settings** (mostly untested)
 - 🔍 Auto-checks for repo, environment, models, CLI, etc. at startup  
-  - ♻️ If you already have models downloaded, you can copy them and re-use them
+  - ♻️ If you already have models/LM's downloaded, you can copy them and re-use them
 - 🕒 **Last results** (double click to play)
 - 🏷️ Auto rename results (**genre - seed - date.mp3**)
-- 🧊 Offload options (needs testing on **16GB VRAM** cards)
+- 🧊 Offload options (needs testing on -16GB VRAM cards)
 - 🧾 Logger
+- ✅ Online updater
 
 ---
 
@@ -63,3 +64,4 @@ A different **Windows** look for **Ace Step 1.5** 🪟✨
 ## 🛠️ Todo
 - 🚀 Toggle to keep the model in VRAM for faster generation
 - 🔧 Try to fix Flash & nano-vllm when I find the time
+- Add more functions /updates
