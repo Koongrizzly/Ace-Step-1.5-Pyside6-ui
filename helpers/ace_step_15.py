@@ -844,7 +844,7 @@ class Settings:
     task_type: str = "text2music"
     audio_format: str = "mp3"
     duration: float = 180.0
-    batch_size: int = 1
+    batch_size: int = 2
     seed: int = -1
 
 
@@ -1633,7 +1633,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        # Save settings on exit so UI toggles/paths persist across restarts.
+        # Persist UI settings on exit.
         try:
             self._save_settings()
         except Exception:
@@ -2129,7 +2129,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Core generation settings (as in your screenshot)
         self.spin_duration = QtWidgets.QDoubleSpinBox()
-        self.spin_duration.setRange(5.0, 600.0)
+        self.spin_duration.setRange(5.0, 480.0)
         self.spin_duration.setDecimals(1)
         self.spin_duration.setSingleStep(5.0)
         self.spin_duration.setToolTip(
@@ -2618,7 +2618,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "and generation will run via the API instead of spawning cli.py each time.\n"
             "This keeps the model in VRAM between runs."
         )
-        self.chk_keep_in_vram.toggled.connect(self._on_keep_in_vram_toggled)
+        self.chk_keep_in_vram.toggled.connect(lambda _on: (self._log("Keep in VRAM changed — restart required to take effect."), self._save_settings()))
 
         perf.addWidget(self.chk_offload_dit, 0, 0)
         perf.addWidget(self.chk_offload, 0, 1)
@@ -5043,23 +5043,7 @@ class MainWindow(QtWidgets.QMainWindow):
             it.setData(QtCore.Qt.UserRole, str(p))
             self.lst_outputs.addItem(it)
 
-    
-    def _on_keep_in_vram_toggled(self, _on: bool) -> None:
-        # Persist immediately so the toggle state is remembered on next launch.
-        try:
-            self.settings.keep_in_vram = bool(self.chk_keep_in_vram.isChecked())
-        except Exception:
-            pass
-        try:
-            self._save_settings()
-        except Exception:
-            pass
-        try:
-            self._log("Keep in VRAM changed — restart required to take effect.")
-        except Exception:
-            pass
-
-def _open_output_folder(self):
+    def _open_output_folder(self):
         out_dir = Path(self.ed_outdir.text().strip())
         if out_dir.exists():
             open_in_explorer(out_dir)
