@@ -1230,7 +1230,7 @@ def _build_generation_info_headless(
             self.log.emit(f"[Keep in VRAM] Failed to write headless API server: {e}")
             return api_server_py
 
-    def start(self, lm_model: str = "") -> None:
+    def start(self, main_model: str = "", lm_model: str = "", lm_auto: bool = True) -> None:
         if self.is_running():
             return
         self._ready_flag = False
@@ -1254,6 +1254,40 @@ def _build_generation_info_headless(
             str(self.port),
         ]
 
+        # ---- Model overrides (applied at server start; avoids editing repo config.json) ----
+        env = os.environ.copy()
+
+        # Force DiT main model when explicitly chosen (non-auto)
+        if main_model:
+            # Set several common override names; unknown ones are ignored by the server.
+            env["ACESTEP_MAIN_MODEL"] = main_model
+            env["ACESTEP_DIT_MODEL"] = main_model
+            env["ACESTEP_MODEL"] = main_model
+            env["ACESTEP_PRIMARY_MODEL"] = main_model
+            env["ACESTEP_CONFIG_PATH"] = main_model
+            env["ACESTEP_CONFIG_PATH2"] = ""
+            env["ACESTEP_CONFIG_PATH3"] = ""
+
+        else:
+            env.pop("ACESTEP_CONFIG_PATH", None)
+            env.pop("ACESTEP_MAIN_MODEL", None)
+            env.pop("ACESTEP_DIT_MODEL", None)
+            env.pop("ACESTEP_MODEL", None)
+            env.pop("ACESTEP_PRIMARY_MODEL", None)
+
+        # LM init mode: auto (GPU-tier) vs manual
+        env["ACESTEP_INIT_LLM"] = "auto" if lm_auto else "true"
+
+        if lm_auto:
+            env.pop("ACESTEP_LM_MODEL_PATH", None)
+
+        # Force LM model when manual selection is active
+        if (not lm_auto) and lm_model:
+            env["ACESTEP_LM_MODEL_PATH"] = lm_model
+            env["ACESTEP_LM_MODEL"] = lm_model
+            env["ACESTEP_LLM_MODEL"] = lm_model
+            # Also pass CLI flag for maximum compatibility
+            args += ["--lm-model-path", lm_model]
         try:
             self._proc = subprocess.Popen(
                 args,
@@ -1261,7 +1295,7 @@ def _build_generation_info_headless(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,
+                env=env,
             )
         except Exception as e:
             self.log.emit(f"[Keep in VRAM] Failed to start API server: {e!r}")
@@ -1722,10 +1756,88 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_server_starting(True)
 
             if not self._api_server.is_running():
-                lm_model = str(getattr(self.settings, "lm_model_path", "") or "")
-                self._log("[Keep in VRAM] Starting API server...")
+                main_model = str(getattr(self.settings, "main_model_path", "") or "").strip()
+                lm_model = str(getattr(self.settings, "lm_model_path", "") or "").strip()
+
+                def _is_auto(val: str) -> bool:
+                    return (not val) or (val.strip().lower() == "auto")
+
+                # LM is auto-selected when dropdown is "auto"/blank
+                lm_auto = _is_auto(lm_model)
+
+                # For main model, pass empty string to mean "auto/default"
+                main_model_arg = "" if _is_auto(main_model) else main_model
+                lm_model_arg = "" if lm_auto else lm_model
+
+                self._log("[Keep in VRAM] Starting API server... (restart required to apply model/LM changes)")
                 self._set_server_starting(True)
-                self._api_server.start(lm_model=lm_model)
+                self._api_server.start(main_model=main_model_arg, lm_model=lm_model_arg, lm_auto=lm_auto)
+        except Exception:
+            pass
+
+    
+    def _on_keep_in_vram_toggled(self, on: bool) -> None:
+        """Enable/disable the Keep-in-VRAM server workflow."""
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+        if not bool(on):
+            # Stop the server when the user disables the toggle.
+            try:
+                self._log("Keep in VRAM disabled. Stopping API server...")
+            except Exception:
+                pass
+            try:
+                if self._api_server is not None:
+                    self._api_server.stop()
+            except Exception:
+                pass
+            self._set_server_starting(False)
+            try:
+                if hasattr(self, "btn_restart_server") and self.btn_restart_server is not None:
+                    self.btn_restart_server.setText("Start server")
+            except Exception:
+                pass
+            return
+
+        # Enabled: start the server (non-blocking).
+        try:
+            self._ensure_api_server_started()
+        except Exception:
+            pass
+
+    def _on_restart_server_clicked(self) -> None:
+        """Start/restart the API server to apply the selected model/LM."""
+        try:
+            # Ensure Keep-in-VRAM mode is enabled.
+            if hasattr(self, "chk_keep_in_vram") and self.chk_keep_in_vram is not None and (not self.chk_keep_in_vram.isChecked()):
+                self.chk_keep_in_vram.setChecked(True)
+                return  # toggled handler will start the server
+        except Exception:
+            pass
+
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+        try:
+            self._log("[Keep in VRAM] Restarting API server... (applying model/LM)")
+        except Exception:
+            pass
+
+        # Stop if running, then start with current settings.
+        try:
+            if self._api_server is not None and self._api_server.is_running():
+                self._api_server.stop()
+        except Exception:
+            pass
+
+        self._set_server_starting(True)
+        try:
+            self._ensure_api_server_started()
         except Exception:
             pass
 
@@ -1768,6 +1880,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.banner.setText(getattr(self, "_banner_base_text", "Music Creation with Ace Step 1.5"))
                 if hasattr(self, "banner_progress"):
                     self.banner_progress.setVisible(False)
+            # Keep the restart/start button in sync.
+            try:
+                if hasattr(self, "btn_restart_server") and self.btn_restart_server is not None:
+                    if bool(starting):
+                        self.btn_restart_server.setEnabled(False)
+                        self.btn_restart_server.setText("Starting…")
+                    else:
+                        self.btn_restart_server.setEnabled(True)
+                        running = bool(self._api_server is not None and self._api_server.is_running())
+                        self.btn_restart_server.setText("Restart server" if running else "Start server")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2656,18 +2780,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_offload_dit = QtWidgets.QCheckBox("Offload DiT to CPU")
         self.chk_flashattn = QtWidgets.QCheckBox("Use Flash Attention")
 
-        self.chk_keep_in_vram = QtWidgets.QCheckBox("Keep in VRAM (needs restart)")
+        self.chk_keep_in_vram = QtWidgets.QCheckBox("Keep in VRAM")
         self.chk_keep_in_vram.setToolTip(
-            "When enabled (after restarting the app), Ace-Step will start the local FastAPI server at launch\n"
-            "and generation will run via the API instead of spawning cli.py each time.\n"
-            "This keeps the model in VRAM between runs."
+            "When enabled, Ace-Step runs generation through the local FastAPI server (keeps the model in VRAM).\n"
+            "Use the button next to this toggle to (re)start the server and apply a different main model / LM."
         )
-        self.chk_keep_in_vram.toggled.connect(lambda _on: (self._log("Keep in VRAM changed — restart required to take effect."), self._save_settings()))
+        self.chk_keep_in_vram.toggled.connect(self._on_keep_in_vram_toggled)
+
+        self.btn_restart_server = QtWidgets.QPushButton("Start server")
+        self.btn_restart_server.setToolTip("Start or restart the local API server to apply the selected model/LM.")
+        self.btn_restart_server.clicked.connect(self._on_restart_server_clicked)
+
+        w_keep = QtWidgets.QWidget()
+        h_keep = QtWidgets.QHBoxLayout(w_keep)
+        h_keep.setContentsMargins(0, 0, 0, 0)
+        h_keep.setSpacing(8)
+        h_keep.addWidget(self.chk_keep_in_vram)
+        h_keep.addWidget(self.btn_restart_server)
 
         perf.addWidget(self.chk_offload_dit, 0, 0)
         perf.addWidget(self.chk_offload, 0, 1)
         perf.addWidget(self.chk_flashattn, 1, 0)
-        perf.addWidget(self.chk_keep_in_vram, 1, 1)
+        perf.addWidget(w_keep, 1, 1)
 
         adv_l.addWidget(gb_perf)
 
@@ -5393,9 +5527,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Small tuning values for nicer placement.
-        left_margin = 12
-        right_margin = 24  # keep a little extra room from the window edge
-        top_margin = 10
+        left_margin = 22
+        right_margin = 18  # keep a little extra room from the window edge
+        top_margin = 9
 
         # Align vertically with the tab bar row (so it doesn't cover the fancy banner),
         # but nudge slightly upward to sit cleanly above the divider line.
@@ -5403,7 +5537,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if hasattr(self, "tabs") and self.tabs is not None:
                 tab_pos = self.tabs.mapTo(self, QtCore.QPoint(0, 0))
-                y = max(top_margin, int(tab_pos.y()) + 2)  # was +4
+                y = max(top_margin, int(tab_pos.y()) - 4)  # was +4
         except Exception:
             pass
 
