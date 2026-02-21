@@ -860,7 +860,7 @@ class Settings:
     seed: int = -1
 
 
-    seed_random: bool = False
+    seed_random: bool = True
     bpm: int = 0  # 0 = auto
     timesignature: int = 0  # 0 = auto
     keyscale: str = ""  # empty = auto
@@ -2315,8 +2315,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         self.spin_seed = QtWidgets.QSpinBox()
-        self.spin_seed.setRange(0, 2_147_483_647)
-        self.spin_seed.setToolTip("Seed used for generation.")
+        self.spin_seed.setRange(-1, 2_147_483_647)
+        self.spin_seed.setToolTip("Seed used for generation. (-1 = random) ")
+        try:
+            self.spin_seed.setValue(-1)
+        except Exception:
+            pass
 
         self.chk_seed_random = QtWidgets.QCheckBox("Random")
         self.chk_seed_random.setToolTip(
@@ -2344,6 +2348,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # keep the seed box display in sync.
         try:
             self.chk_seed_random.toggled.connect(self._on_seed_random_toggled)
+            try:
+                self.chk_seed_random.toggled.connect(lambda _on: self._save_settings())
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            self.spin_seed.valueChanged.connect(lambda _v: self._save_settings())
         except Exception:
             pass
 
@@ -3195,7 +3208,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 legacy_random = (int(getattr(s, 'seed', 0) or 0) < 0)
             except Exception:
                 legacy_random = False
-            use_random = bool(getattr(s, 'seed_random', False) or legacy_random)
+            use_random = bool(getattr(s, 'seed_random', True) or legacy_random)
             try:
                 self.chk_seed_random.blockSignals(True)
                 self.chk_seed_random.setChecked(use_random)
@@ -3730,8 +3743,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, 'chk_seed_random'):
                     self.chk_seed_random.setChecked(use_random)
                     self._on_seed_random_toggled(use_random)
-                if sval < 0:
-                    sval = 0
+                if sval < -1:
+                    sval = -1
                 self.spin_seed.setValue(int(sval))
         except Exception:
             pass
