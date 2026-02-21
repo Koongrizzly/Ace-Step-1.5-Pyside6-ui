@@ -37,7 +37,7 @@ How to add a preset ? It wll first ask for the main genre (eg 'Rock', next it as
 - Offload options (needs testing on -16 gig vram cards)
 - logger
 - Online updater
-- Queue for unlimited generations with cancel running / remove from queue, still keeps selection 1-4 (or 8 with some models) as 1 job
+- Queue for unlimited generations with cancel running / remove from queue, still keeps selection 1-4 (or 8 with some models) as 1 job. Queue has mmemory to continue after restart app
 
 ---
 
