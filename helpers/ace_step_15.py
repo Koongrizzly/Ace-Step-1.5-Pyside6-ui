@@ -83,7 +83,7 @@ def _fv_patch_wheel_event(cls):
         try:
             event.ignore()
         except Exception:
-            passs
+            pass
 
     cls.wheelEvent = _wheel_event
     cls._fv_wheel_guard_patched = True
@@ -213,7 +213,7 @@ def guess_framevision_root() -> Path:
             if (cur / "models").exists() and (cur / "environments").exists():
                 return cur
         except Exception:
-            passs
+            pass
         if cur.parent == cur:
             break
         cur = cur.parent
@@ -668,7 +668,7 @@ class PresetManagerDialog(QtWidgets.QDialog):
             self._mw._ace15_last_preset_genre = str(g or "").strip()
             self._mw._ace15_last_preset_subgenre = str(s or "").strip()
         except Exception:
-            passs
+            pass
         self._mw._ace15_apply_preset_payload(pd)
 
 
@@ -881,14 +881,47 @@ class Settings:
             try:
                 d[k] = getattr(self, k)
             except Exception:
-                passs
+                pass
         # Also include any dynamic instance attributes.
         try:
             for k, v in self.__dict__.items():
                 d[k] = v
         except Exception:
-            passs
+            pass
         return d
+
+
+@dataclass
+class QueueJob:
+    """A single generation job.
+
+    NOTE: "batch_size" (1–8) is part of the job and represents ONE job that
+    produces multiple tracks inside that job.
+    """
+
+    job_id: int
+    created_epoch: float
+    use_api: bool
+    out_dir: Path
+
+    # CLI workflow
+    cli_args: Optional[list[str]] = None
+    cli_cwd: Optional[Path] = None
+    cfg_path: Optional[Path] = None
+
+    # API workflow
+    api_payload: Optional[dict] = None
+    api_base_url: Optional[str] = None
+
+    # Human readable metadata for the Queue tab
+    title: str = ""
+    batch_size: int = 1
+    seed: str = ""
+    # IMPORTANT: naming fields are snapshotted at enqueue time so queued jobs
+    # don't get renamed using whatever preset happens to be selected later.
+    subgenre_for_naming: str = ""
+    task_type: str = ""
+    duration_s: float = 0.0
 
     @staticmethod
     def from_dict(d: dict) -> "Settings":
@@ -958,7 +991,7 @@ class Runner(QtCore.QObject):
                         self._proc.stdin.write("\n")
                         self._proc.stdin.flush()
                     except Exception:
-                        passs
+                        pass
 
 
             if self._stop and self._proc and self._proc.poll() is None:
@@ -1030,7 +1063,7 @@ class ApiServerManager(QtCore.QObject):
             if headless_py.exists() and headless_py.stat().st_mtime >= api_server_py.stat().st_mtime:
                 return headless_py
         except Exception:
-            passs
+            pass
 
         patched = src
 
@@ -1158,7 +1191,7 @@ def _build_generation_info_headless(
         try:
             self.ready.emit()
         except Exception:
-            passs
+            pass
 
     def wait_until_ready(self, timeout_sec: float = 15.0) -> bool:
         """Wait until the API server is reachable on HTTP (best effort)."""
@@ -1183,7 +1216,7 @@ def _build_generation_info_headless(
                         self._ready_flag = True
                         return True
             except Exception:
-                passs
+                pass
             time.sleep(0.25)
         return False
 
@@ -1198,7 +1231,7 @@ def _build_generation_info_headless(
                 except Exception:
                     self._proc.kill()
         except Exception:
-            passs
+            pass
         self._reader_obj = None
         self._proc = None
 
@@ -1229,7 +1262,7 @@ class _ApiLogReader(QtCore.QObject):
                 rc = self.proc.wait(timeout=0.1)
                 self.log.emit(f"[Keep in VRAM] API server exited (code {rc})")
             except Exception:
-                passs
+                pass
         finally:
             self.finished.emit()
 
@@ -1248,6 +1281,10 @@ class ApiRunner(QtCore.QObject):
         self.output_dir = output_dir
         self.timeout_s = timeout_s
         self._stop = False
+
+        # Captured outputs for post-processing (renaming with correct per-output seeds).
+        # List of (Path, seed_int_or_None)
+        self.saved_outputs: list[tuple[Path, Optional[int]]] = []
 
     def stop(self):
         self._stop = True
@@ -1297,7 +1334,8 @@ class ApiRunner(QtCore.QObject):
             # Always run API jobs as single-output to guarantee we get N files.
             base_payload["batch_size"] = 1
 
-            saved_paths = []
+            saved_paths: list[Path] = []
+            saved_meta: list[tuple[Path, Optional[int]]] = []
             for i in range(requested_n):
                 if self._stop:
                     self.log.emit("[Keep in VRAM] Stopped.")
@@ -1309,16 +1347,26 @@ class ApiRunner(QtCore.QObject):
                 # Seed strategy:
                 # - If random seeds enabled -> new random seed per output.
                 # - Else -> deterministic: base_seed + i (if base_seed exists).
+                seed_for_this_output: Optional[int] = None
                 if use_random_seed:
                     try:
                         payload["seed"] = random.randint(0, 2**32 - 1)
                     except Exception:
                         payload["seed"] = int(time.time() * 1000) & 0xFFFFFFFF
                     payload["use_random_seed"] = False
+                    try:
+                        seed_for_this_output = int(payload.get("seed"))
+                    except Exception:
+                        seed_for_this_output = None
                 else:
                     if base_seed is not None:
                         payload["seed"] = int(base_seed + i)
                         payload["use_random_seed"] = False
+                    try:
+                        if payload.get("seed") is not None:
+                            seed_for_this_output = int(payload.get("seed"))
+                    except Exception:
+                        seed_for_this_output = None
 
                 self.log.emit(f"[Keep in VRAM] Submitting task to API server... ({i+1}/{requested_n})")
                 r = self._http_json("/release_task", payload)
@@ -1389,6 +1437,7 @@ class ApiRunner(QtCore.QObject):
                                 out_path = self.output_dir / f"ace15_api_{stamp}{suffix}.{ext}"
                                 out_path.write_bytes(audio_bytes)
                                 saved_paths.append(out_path)
+                                saved_meta.append((out_path, seed_for_this_output))
                                 self.log.emit(f"[Keep in VRAM] Saved: {out_path}")
 
                             break  # done polling this task
@@ -1401,6 +1450,10 @@ class ApiRunner(QtCore.QObject):
                     time.sleep(0.8)
 
             # All requested outputs done.
+            try:
+                self.saved_outputs = list(saved_meta)
+            except Exception:
+                self.saved_outputs = []
             self.finished.emit(0)
             return
 
@@ -1425,10 +1478,16 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 uninstall_no_wheel_guard()
         except Exception:
-            passs
+            pass
 
         self._thread: Optional[QtCore.QThread] = None
         self._runner: Optional[Runner] = None
+
+        # Job queue
+        self._queue: list[QueueJob] = []
+        self._next_job_id: int = 1
+        self._active_job: Optional[QueueJob] = None
+        self._queue_pump_timer: Optional[QtCore.QTimer] = None
 
         # Optional API server workflow ("Keep in VRAM")
         self._api_server: Optional[ApiServerManager] = None
@@ -1463,15 +1522,25 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, 'cmb_lm_model'):
                 self._refresh_lm_models()
         except Exception:
-            passs
+            pass
         self._refresh_outputs()
+        self._queue_refresh_ui()
+
+        # Queue pump: if we have queued jobs and we're idle, start them.
+        try:
+            self._queue_pump_timer = QtCore.QTimer(self)
+            self._queue_pump_timer.setInterval(750)
+            self._queue_pump_timer.timeout.connect(self._queue_pump)
+            self._queue_pump_timer.start()
+        except Exception:
+            self._queue_pump_timer = None
 
         # If enabled, start the FastAPI server now so models stay resident in VRAM.
         try:
             if bool(getattr(self.settings, "keep_in_vram", False)):
                 self._ensure_api_server_started()
         except Exception:
-            passs
+            pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # Best-effort: stop API server on exit.
@@ -1479,7 +1548,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._api_server is not None:
                 self._api_server.stop()
         except Exception:
-            passs
+            pass
         super().closeEvent(event)
 
     def _ensure_api_server_started(self) -> None:
@@ -1514,7 +1583,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_server_starting(True)
                 self._api_server.start(lm_model=lm_model)
         except Exception:
-            passs
+            pass
 
     def _is_api_ready(self) -> bool:
         try:
@@ -1540,7 +1609,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             if bool(getattr(self.settings, "keep_in_vram", False)) and self._server_starting:
-                self.btn_run.setEnabled(False)
+                # Keep enabled so the user can queue jobs while the server warms up.
+                self.btn_run.setEnabled(True)
                 # Banner + progress bar
                 if hasattr(self, "banner"):
                     self.banner.setText("Starting server")
@@ -1555,13 +1625,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "banner_progress"):
                     self.banner_progress.setVisible(False)
         except Exception:
-            passs
+            pass
 
     def _on_api_server_ready(self) -> None:
         try:
             self._log("[Keep in VRAM] API server ready.")
         except Exception:
-            passs
+            pass
         # Unlock Generate if we're not currently generating.
         self._set_server_starting(False)
 
@@ -1588,16 +1658,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Button: small, single-character spinner (constant width)
         try:
-            self.btn_run.setText(f"Generating {f1}")
+            self.btn_run.setText(f"Generating {f1}  (click to queue)")
         except Exception:
-            passs
+            pass
 
         # Banner: progress animation handled by self.banner_progress (if present)
         try:
             if hasattr(self, "banner") and hasattr(self, "banner_progress") and self.btn_stop.isEnabled():
                 self.banner.setText("Generating")
         except Exception:
-            passs
+            pass
 
 
     def _build_ui(self):
@@ -1705,7 +1775,71 @@ class MainWindow(QtWidgets.QMainWindow):
         page_l.setSpacing(12)
 
         # -------------------------
-        # Tab 2: Advanced (scrollable)
+        # Tab 2: Queue
+        # -------------------------
+        tab_queue = QtWidgets.QWidget()
+        self.tabs.addTab(tab_queue, "Queue")
+        tq = QtWidgets.QVBoxLayout(tab_queue)
+        tq.setContentsMargins(12, 12, 12, 12)
+        tq.setSpacing(10)
+
+        self.lbl_queue_state = QtWidgets.QLabel("Idle")
+        self.lbl_queue_state.setObjectName("ace15_queue_state")
+        tq.addWidget(self.lbl_queue_state, 0)
+
+        self.tbl_queue = QtWidgets.QTableWidget(0, 7)
+        self.tbl_queue.setObjectName("ace15_queue_table")
+        self.tbl_queue.setHorizontalHeaderLabels([
+            "#",
+            "Status",
+            "Tracks",
+            "Task",
+            "Duration",
+            "Seed",
+            "Title",
+        ])
+        self.tbl_queue.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.tbl_queue.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.tbl_queue.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.tbl_queue.verticalHeader().setVisible(False)
+        try:
+            self.tbl_queue.horizontalHeader().setStretchLastSection(True)
+            self.tbl_queue.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+            self.tbl_queue.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+            self.tbl_queue.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+            self.tbl_queue.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+            self.tbl_queue.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+            self.tbl_queue.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
+        except Exception:
+            pass
+        
+        # Queue table: refresh is throttled to avoid fighting row selection.
+        self.tbl_queue.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tbl_queue.customContextMenuRequested.connect(self._queue_context_menu)
+
+        # Refresh the queue view every 5 seconds (otherwise it can interrupt selection).
+        self._queue_last_ui_refresh = 0.0
+        self._queue_ui_timer = QtCore.QTimer(self)
+        self._queue_ui_timer.setInterval(5000)
+        self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=True))
+        self._queue_ui_timer.start()
+        tq.addWidget(self.tbl_queue, 1)
+
+        row_qbtn = QtWidgets.QHBoxLayout()
+        self.btn_queue_start_next = QtWidgets.QPushButton("Start next")
+        self.btn_queue_remove = QtWidgets.QPushButton("Remove selected")
+        self.btn_queue_clear = QtWidgets.QPushButton("Clear")
+        self.btn_queue_start_next.clicked.connect(self._queue_start_next)
+        self.btn_queue_remove.clicked.connect(self._queue_remove_selected)
+        self.btn_queue_clear.clicked.connect(self._queue_clear)
+        row_qbtn.addWidget(self.btn_queue_start_next)
+        row_qbtn.addStretch(1)
+        row_qbtn.addWidget(self.btn_queue_remove)
+        row_qbtn.addWidget(self.btn_queue_clear)
+        tq.addLayout(row_qbtn)
+
+        # -------------------------
+        # Tab 3: Advanced (scrollable)
         # -------------------------
         tab_adv = QtWidgets.QWidget()
         self.tabs.addTab(tab_adv, "Advanced")
@@ -1742,7 +1876,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ed_caption.setMaximumHeight(cap_h)
             self.ed_caption.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         except Exception:
-            passs
+            pass
         v.addWidget(QtWidgets.QLabel("Caption / description"))
         v.addWidget(self.ed_caption, 0)
 
@@ -1778,7 +1912,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.ed_lyrics.setMaximumHeight(cap_h)
             self.ed_lyrics.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         except Exception:
-            passs
+            pass
         v.addWidget(self.ed_lyrics, 0)
 
         # Layout (more responsive): use a grid so the UI spreads out on wide windows,
@@ -1886,7 +2020,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.chk_thinking.toggled.connect(self._update_lm_sampling_enabled)
         except Exception:
-            passs
+            pass
         self._update_lm_sampling_enabled()
 
         # Core generation settings (as in your screenshot)
@@ -1939,7 +2073,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.chk_seed_random.toggled.connect(self._on_seed_random_toggled)
         except Exception:
-            passs
+            pass
 
         self.spin_bpm = QtWidgets.QSpinBox()
         self.spin_bpm.setRange(0, 300)
@@ -2057,7 +2191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_save.clicked.connect(self._save_settings)
         self.btn_run = QtWidgets.QPushButton("Generate")
         self.btn_run.setObjectName("ace15_btn_generate")
-        self.btn_run.clicked.connect(self._start)
+        self.btn_run.clicked.connect(self._on_generate_clicked)
 
         # Prepare busy animation timer (text-only, no assets needed)
         try:
@@ -2105,11 +2239,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Keep Generate button width stable while animating (reserve space for 'Generating...')
         try:
             fm = QtGui.QFontMetrics(self.btn_run.font())
-            target = fm.horizontalAdvance("Generating ⠋") + 28
+            target = fm.horizontalAdvance("Generating ⠋  (click to queue)") + 28
             if self.btn_run.minimumWidth() < target:
                 self.btn_run.setMinimumWidth(target)
         except Exception:
-            passs
+            pass
 
         # Hover style for footer buttons: blue→green gradient (same as Generate)
         self._footer_bar.setStyleSheet(
@@ -2208,7 +2342,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._preview_player.durationChanged.connect(self._preview_on_duration_changed)
                 self._preview_player.playbackStateChanged.connect(self._preview_on_state_changed)
             except Exception:
-                passs
+                pass
 
         page_l.addWidget(gb_preview, 0)
 
@@ -2320,7 +2454,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.cmb_main_model.currentIndexChanged.connect(self._update_shift_ui)
         except Exception:
-            passs
+            pass
         form.addRow("Main model", self._row(self.cmb_main_model, self.btn_refresh_main))
 
         self.cmb_lm_model = QtWidgets.QComboBox()
@@ -2423,7 +2557,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fm = QtGui.QFontMetrics(self.txt_log.font())
             self.txt_log.setMinimumHeight(int(fm.lineSpacing() * 16 + 22))
         except Exception:
-            passs
+            pass
         logs_l.addWidget(self.txt_log, 1)
 
         adv_l.addWidget(gb_logs)
@@ -2492,7 +2626,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if app is not None:
                 apply_theme(app, n)
         except Exception:
-            passs
+            pass
 
     def _on_theme_selected_simple(self, name: str, action_group: QtGui.QActionGroup) -> None:
         self._current_theme = (name or "Signal Grey").strip() or "Signal Grey"
@@ -2501,13 +2635,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.settings.ui_theme = self._current_theme
             self._save_settings()
         except Exception:
-            passs
+            pass
         # Keep menu checkmarks in sync.
         try:
             for a in action_group.actions():
                 a.setChecked(a.text() == self._current_theme)
         except Exception:
-            passs
+            pass
 
     def _row(self, edit: QtWidgets.QWidget, button: QtWidgets.QPushButton) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -2539,14 +2673,14 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 s = Settings.from_dict(json.loads(load_path.read_text(encoding="utf-8")))
             except Exception:
-                passs
+                pass
 
         # If the loaded settings point to a different FrameVision root, use that for future saves.
         try:
             fv2 = Path((s.framevision_root or "").strip()) if (s.framevision_root or "").strip() else fv
             self.settings_path = settings_path_for_root(fv2)
         except Exception:
-            passs
+            pass
 
         # Migration: older builds used /output/ace_step_15/ as the default.
         # If user never customized it (or it's empty), switch to the new default.
@@ -2556,7 +2690,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not (s.output_dir or "").strip() or os.path.normpath(s.output_dir) == os.path.normpath(old_default):
                 s.output_dir = new_default
         except Exception:
-            passs
+            pass
 
         # Migration: older builds used seed=-1 to mean random.
         # New builds use a dedicated Random toggle and keep the visible seed non-negative.
@@ -2565,7 +2699,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.seed = 0
                 s.seed_random = True
         except Exception:
-            passs
+            pass
         return s
 
     def _auto_detect_paths(self):
@@ -2608,7 +2742,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             ensure_dir(Path(s.output_dir))
         except Exception:
-            passs
+            pass
 
         # Push into UI fields if present
         try:
@@ -2623,7 +2757,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "ed_outdir"):
                 self.ed_outdir.setText(s.output_dir)
         except Exception:
-            passs
+            pass
 
         # Status label for quick debugging
         try:
@@ -2640,7 +2774,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     self.lbl_paths_status.setText("Auto paths: OK")
         except Exception:
-            passs
+            pass
 
 
     def _pull_ui_to_settings(self):
@@ -2662,7 +2796,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "act_wheel_guard"):
                 s.wheel_guard_enabled = bool(self.act_wheel_guard.isChecked())
         except Exception:
-            passs
+            pass
 
         s.task_type = self.cmb_task.currentText().strip()
         s.backend = self.cmb_backend.currentText().strip()
@@ -2670,7 +2804,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 s.shift = float(self.spin_shift.value())
             except Exception:
-                passs
+                pass
         s.log_level = self.cmb_loglevel.currentText().strip()
         s.audio_format = self.cmb_format.currentText().strip()
         s.duration = float(self.spin_duration.value())
@@ -2775,7 +2909,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self.spin_seed.setEnabled(not bool(use_random))
             except Exception:
-                passs
+                pass
 
         # Negatives (LM guidance)
         if hasattr(self, 'ed_negatives'):
@@ -2886,7 +3020,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._update_shift_ui()
         except Exception:
-            passs
+            pass
 
     def _update_lm_sampling_enabled(self) -> None:
         """Enable/disable LM sampling controls based on 'Enable LM'."""
@@ -2900,14 +3034,14 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self.chk_parallel_thinking.setEnabled(on)
             except Exception:
-                passs
+                pass
         for attr in ("spin_lm_temp", "spin_lm_top_p", "spin_lm_top_k"):
             w = getattr(self, attr, None)
             if w is not None:
                 try:
                     w.setEnabled(on)
                 except Exception:
-                    passs
+                    pass
 
 
 
@@ -2940,7 +3074,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.spin_shift.setEnabled(bool(supported))
         except Exception:
-            passs
+            pass
 
         # Tooltip should explain what's happening.
         try:
@@ -2957,7 +3091,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "(Switch Main model back to a Base model to enable.)"
                 )
         except Exception:
-            passs
+            pass
 
     def _set_combo(self, cmb: QtWidgets.QComboBox, value: str):
         idx = cmb.findText(value)
@@ -3007,7 +3141,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ensure_dir(path.parent)
                 path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception:
-                passs
+                pass
             return data
 
     def _ace15_preset_mgr_save(self, path: Path, data: dict) -> None:
@@ -3021,7 +3155,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._pull_ui_to_settings()
         except Exception:
-            passs
+            pass
 
         caption = self.ed_caption.toPlainText().strip()
         neg_prompt = self.ed_negatives.toPlainText().strip() if hasattr(self, "ed_negatives") else ""
@@ -3187,7 +3321,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if idx >= 0:
                     self.cmb_backend.setCurrentIndex(idx)
         except Exception:
-            passs
+            pass
 
         # Vocal language
         try:
@@ -3210,29 +3344,29 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         self.cmb_vocal_language.setEditText(vl)
         except Exception:
-            passs
+            pass
 
         try:
             if "shift" in preset and hasattr(self, 'spin_shift'):
                 self.spin_shift.setValue(float(preset.get("shift") or 3.0))
         except Exception:
-            passs
+            pass
 
         try:
             if "lm_temperature" in preset and hasattr(self, "spin_lm_temp"):
                 self.spin_lm_temp.setValue(float(preset.get("lm_temperature") or 0.85))
         except Exception:
-            passs
+            pass
         try:
             if "lm_top_p" in preset and hasattr(self, "spin_lm_top_p"):
                 self.spin_lm_top_p.setValue(float(preset.get("lm_top_p") or 0.95))
         except Exception:
-            passs
+            pass
         try:
             if "lm_top_k" in preset and hasattr(self, "spin_lm_top_k"):
                 self.spin_lm_top_k.setValue(int(preset.get("lm_top_k") or 0))
         except Exception:
-            passs
+            pass
 
 
         try:
@@ -3242,7 +3376,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if idx >= 0:
                     self.cmb_format.setCurrentIndex(idx)
         except Exception:
-            passs
+            pass
 
         try:
             task = str(preset.get("task_type") or "").strip()
@@ -3251,7 +3385,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if idx >= 0:
                     self.cmb_task.setCurrentIndex(idx)
         except Exception:
-            passs
+            pass
 
         # Text fields
         try:
@@ -3259,7 +3393,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if isinstance(cap, str):
                 self.ed_caption.setPlainText(cap)
         except Exception:
-            passs
+            pass
         try:
             neg = preset.get("negatives")
             if not isinstance(neg, str):
@@ -3267,7 +3401,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if isinstance(neg, str) and hasattr(self, 'ed_negatives'):
                 self.ed_negatives.setPlainText(neg)
         except Exception:
-            passs
+            pass
         try:
             lyr = preset.get("lyrics")
             if isinstance(lyr, str):
@@ -3276,19 +3410,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     self.ed_lyrics.setPlainText(lyr)
         except Exception:
-            passs
+            pass
 
         # Numeric
         try:
             if "duration" in preset:
                 self.spin_duration.setValue(float(preset.get("duration") or 0.0))
         except Exception:
-            passs
+            pass
         try:
             if "batch_size" in preset:
                 self.spin_batch.setValue(int(preset.get("batch_size") or 1))
         except Exception:
-            passs
+            pass
         try:
             if "seed" in preset:
                 sval = int(preset.get("seed") or 0)
@@ -3301,12 +3435,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     sval = 0
                 self.spin_seed.setValue(int(sval))
         except Exception:
-            passs
+            pass
         try:
             if "bpm" in preset and hasattr(self, 'spin_bpm'):
                 self.spin_bpm.setValue(int(preset.get("bpm") or 0))
         except Exception:
-            passs
+            pass
         try:
             ts = preset.get("time_sig")
             if ts is None:
@@ -3319,7 +3453,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.cmb_timesig.setCurrentIndex(i)
                         break
         except Exception:
-            passs
+            pass
         try:
             ks = preset.get("key_scale")
             if ks is None:
@@ -3336,7 +3470,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not found and self.cmb_keyscale.isEditable():
                     self.cmb_keyscale.setCurrentText(ks)
         except Exception:
-            passs
+            pass
 
         # LM flags
         try:
@@ -3346,7 +3480,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 enable_lm_val = preset.get("thinking")
             self.chk_thinking.setChecked(bool(enable_lm_val))
         except Exception:
-            passs
+            pass
         try:
             thinking_val = preset.get("thinking")
             if thinking_val is None:
@@ -3354,7 +3488,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, 'chk_thinking_mode'):
                 self.chk_thinking_mode.setChecked(bool(thinking_val))
         except Exception:
-            passs
+            pass
 
         # Parallel thinking
         try:
@@ -3364,7 +3498,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, 'chk_parallel_thinking'):
                 self.chk_parallel_thinking.setChecked(bool(pt_val))
         except Exception:
-            passs
+            pass
         try:
             enhance_val = preset.get("lm_enhance_prompt")
             if enhance_val is None:
@@ -3372,13 +3506,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "chk_lm_enhance"):
                 self.chk_lm_enhance.setChecked(bool(enhance_val))
         except Exception:
-            passs
+            pass
 
         # Instrumental
         try:
             self.chk_instrumental.setChecked(bool(preset.get("instrumental")))
         except Exception:
-            passs
+            pass
 
         # Optional generation controls
         try:
@@ -3388,7 +3522,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif "guidance_scale" in preset:
                     self.spin_guidance.setValue(float(preset.get("guidance_scale") or 0.0))
         except Exception:
-            passs
+            pass
         try:
             if hasattr(self, 'spin_steps'):
                 if "steps" in preset:
@@ -3396,7 +3530,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif "inference_steps" in preset:
                     self.spin_steps.setValue(int(preset.get("inference_steps") or 0))
         except Exception:
-            passs
+            pass
         try:
             if hasattr(self, 'cmb_infer_method') and "infer_method" in preset:
                 im = _ace15_normalize_infer_method(str(preset.get("infer_method") or "").strip())
@@ -3413,7 +3547,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         else:
                             self.cmb_infer_method.setCurrentIndex(0)
         except Exception:
-            passs
+            pass
 
         # Models
         try:
@@ -3426,7 +3560,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if idx >= 0:
                     self.cmb_main_model.setCurrentIndex(idx)
         except Exception:
-            passs
+            pass
         try:
             lm_sel = preset.get("lm_model")
             if not lm_sel:
@@ -3437,13 +3571,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if idx >= 0:
                     self.cmb_lm_model.setCurrentIndex(idx)
         except Exception:
-            passs
+            pass
 
         # Optional: persist after apply
         try:
             self._save_settings()
         except Exception:
-            passs
+            pass
 
     def _open_preset_manager(self):
         try:
@@ -3567,7 +3701,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._update_shift_ui()
         except Exception:
-            passs
+            pass
 
     
     def _refresh_lm_models(self):
@@ -3664,13 +3798,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.spin_seed.setEnabled(not bool(on))
         except Exception:
-            passs
+            pass
         if on:
             # Immediately show a valid random seed (so the user never sees "-1").
             try:
                 self.spin_seed.setValue(self._ace15_generate_seed())
             except Exception:
-                passs
+                pass
 
     def _ace15_prepare_seed_for_run(self):
         """If Random is enabled, generate a fresh seed and show it in the UI."""
@@ -3678,7 +3812,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, 'chk_seed_random') and self.chk_seed_random.isChecked():
                 self.spin_seed.setValue(self._ace15_generate_seed())
         except Exception:
-            passs
+            pass
 
     def _make_config(self, out_dir: Path) -> Path:
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -3737,7 +3871,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if vl:
                     config["vocal_language"] = vl
         except Exception:
-            passs
+            pass
 
         # Optional generation controls
         try:
@@ -3745,14 +3879,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if gs > 0.0:
                 config["guidance_scale"] = gs
         except Exception:
-            passs
+            pass
 
         try:
             steps = int(self.spin_steps.value()) if hasattr(self, 'spin_steps') else 0
             if steps > 0:
                 config["inference_steps"] = steps
         except Exception:
-            passs
+            pass
 
         try:
             im = ""
@@ -3764,7 +3898,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if im:
                 config["infer_method"] = im
         except Exception:
-            passs
+            pass
 
 
         # User-selected meta overrides (0/auto = let ACE decide)
@@ -3790,7 +3924,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if enable_lm and pt:
                 config["parallel_thinking"] = True
         except Exception:
-            passs
+            pass
 
         # Negative prompt for LM guidance (optional)
         if neg_prompt:
@@ -3867,87 +4001,87 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_path.write_text(toml_dumps_flat(clean), encoding="utf-8")
         return cfg_path
 
-    def _start(self):
+    # -----------------------------
+    # Queue
+    # -----------------------------
+    def _is_running(self) -> bool:
+        return self._active_job is not None or self._runner is not None or self._thread is not None
+
+    def _queue_job_title_from_ui(self) -> str:
+        try:
+            cap = (self.ed_caption.toPlainText() or "").strip()
+            if cap:
+                first = cap.splitlines()[0].strip()
+                if first:
+                    return first[:80]
+        except Exception:
+            pass
+        return (self._ace15_pick_subgenre_for_naming() or "Job")[:80]
+
+    def _build_job_from_ui(self) -> Optional[QueueJob]:
+        """Snapshot the current UI into a QueueJob.
+
+        This is called both when starting immediately and when enqueueing while a
+        run is active.
+        """
         err = self._validate()
         if err:
             QtWidgets.QMessageBox.warning(self, "Fix this first", err)
-            return
+            return None
 
         # If Random is enabled, generate a fresh seed and show it (instead of -1).
         self._ace15_prepare_seed_for_run()
 
+        # Persist UI settings as usual.
         self._pull_ui_to_settings()
         self._save_settings()
 
         out_dir = Path(self.ed_outdir.text().strip())
         ensure_dir(out_dir)
 
-        # Snapshot outputs before the run so we can identify what was generated.
-        try:
-            self._ace15_out_snapshot = {str(p.resolve()) for p in list_audio_files(out_dir)}
-        except Exception:
-            self._ace15_out_snapshot = set()
-        self._ace15_run_started_epoch = time.time()
+        use_api = bool(getattr(self.settings, 'keep_in_vram', False))
+        envpy = Path(self.ed_envpy.text().strip())
+        proj = Path(self.ed_projectroot.text().strip())
+        clipy = Path(self.ed_clipypy.text().strip())
 
+        # Write config now (so queued jobs keep their parameters).
         cfg_path = self._make_config(out_dir)
         self._log(f"Saved config:\n  {cfg_path}")
 
-        # Remember run context for post-run housekeeping.
-        self._last_out_dir = out_dir
-        self._last_cfg_path = cfg_path
+        # Metadata for display.
+        try:
+            batch_size = int(self.spin_batch.value())
+        except Exception:
+            batch_size = 1
+        try:
+            seed_s = str(int(self.spin_seed.value()))
+        except Exception:
+            seed_s = "AUTO"
+        try:
+            task_type = str(self.cmb_task.currentText().strip() or 'text2music')
+        except Exception:
+            task_type = ""
+        try:
+            dur = float(self.spin_duration.value())
+        except Exception:
+            dur = 0.0
 
-        # Choose workflow: CLI (default) or API server (Keep in VRAM).
-        use_api = bool(getattr(self.settings, 'keep_in_vram', False))
+        job = QueueJob(
+            job_id=self._next_job_id,
+            created_epoch=time.time(),
+            use_api=use_api,
+            out_dir=out_dir,
+            cfg_path=cfg_path,
+            title=self._queue_job_title_from_ui(),
+            batch_size=batch_size,
+            seed=seed_s,
+            subgenre_for_naming=self._ace15_pick_subgenre_for_naming(),
+            task_type=task_type,
+            duration_s=dur,
+        )
+        self._next_job_id += 1
 
-        envpy = Path(self.ed_envpy.text().strip())
-        proj = Path(self.ed_projectroot.text().strip())
-        self._last_proj_root = proj
-
-        # If Keep in VRAM is enabled, don't allow Generate until the server is fully ready.
         if use_api:
-            self._ensure_api_server_started()
-            if not self._is_api_ready():
-                # UI is already put into 'Starting server' state by _ensure_api_server_started().
-                try:
-                    self.lbl_status.setText("Starting server…")
-                except Exception:
-                    passs
-                self._log("[Keep in VRAM] Server is still starting. Generate is disabled until it is ready.")
-                return
-
-        self._set_busy(True)
-        self.lbl_status.setText("Running…")
-
-        self._thread = QtCore.QThread()
-
-        if use_api:
-            # Ensure server is up.
-            self._ensure_api_server_started()
-            if self._api_server is None or not self._api_server.is_running():
-                self._set_busy(False)
-                self.lbl_status.setText("Idle")
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "API server not running",
-                    "Keep in VRAM is enabled, but the API server could not be started.\n"
-                    "Check the log for details, or disable 'Keep in VRAM (needs restart)'.",
-                )
-                return
-
-            # Wait until the server is actually accepting connections (prevents ConnectionRefused).
-            if not self._api_server.wait_until_ready(timeout_sec=20.0):
-                self._set_busy(False)
-                self.lbl_status.setText("Idle")
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "API server not ready",
-                    "The API server process started, but it did not become reachable on the configured port.\n"
-                    "Check the log output above for errors (missing deps, wrong CUDA, port blocked),\n"
-                    "or disable 'Keep in VRAM (needs restart)'.",
-                )
-                return
-
-            # Build API payload from UI.
             caption = self.ed_caption.toPlainText().strip()
             lyrics = self.ed_lyrics.toPlainText().strip()
             if self.chk_instrumental.isChecked():
@@ -3979,7 +4113,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 "lm_top_k": int(getattr(self.settings, 'lm_top_k', 0) or 0),
                 "lm_negative_prompt": str(getattr(self.settings, 'lm_negative_prompt', '') or 'NO USER INPUT') or 'NO USER INPUT',
             }
-            # Normalize a few "auto" values.
             if payload.get("bpm") == 0:
                 payload["bpm"] = None
             if not (payload.get("key_scale") or "").strip():
@@ -3993,17 +4126,288 @@ class MainWindow(QtWidgets.QMainWindow):
             im = _ace15_normalize_infer_method(str(payload.get("infer_method") or ""))
             payload["infer_method"] = im or "ode"
 
-            self._runner = ApiRunner(base_url=self._api_server.base_url, payload=payload, output_dir=out_dir)
+            job.api_payload = payload
         else:
-            clipy = Path(self.ed_clipypy.text().strip())
-            args = [str(envpy), str(clipy), "-c", str(cfg_path)]
-            self._runner = Runner(args=args, cwd=proj, hide_console=False)  # forced OFF (UI removed)
+            job.cli_args = [str(envpy), str(clipy), "-c", str(cfg_path)]
+            job.cli_cwd = proj
+
+        return job
+
+    def _queue_refresh_ui(self, force: bool = False) -> None:
+
+        # Throttle full table rebuilds; they can interrupt row selection.
+        now = time.time()
+        last = float(getattr(self, "_queue_last_ui_refresh", 0.0) or 0.0)
+        allow_full = force or (now - last) >= 5.0
+
+        # Remember current selection (by job_id) so we can restore it after refresh.
+        selected_job_id: Optional[int] = None
+        try:
+            sel = self.tbl_queue.selectionModel().selectedRows()
+            if sel:
+                r = int(sel[0].row())
+                it = self.tbl_queue.item(r, 0)
+                if it is not None:
+                    selected_job_id = it.data(QtCore.Qt.UserRole)
+        except Exception:
+            selected_job_id = None
+        try:
+            is_running = self._active_job is not None
+            qn = len(self._queue)
+            if is_running:
+                self.lbl_queue_state.setText(f"Running job #{self._active_job.job_id} — queued: {qn}")
+            else:
+                self.lbl_queue_state.setText(f"Idle — queued: {qn}")
+        except Exception:
+            pass
+
+        # If we're within the throttle window, don't rebuild the table.
+        if not allow_full:
+            try:
+                self.btn_queue_start_next.setEnabled((not self._is_running()) and len(self._queue) > 0)
+                self.btn_queue_clear.setEnabled(len(self._queue) > 0)
+            except Exception:
+                pass
+            return
+
+        try:
+            self.tbl_queue.setRowCount(0)
+        except Exception:
+            return
+
+        rows: list[tuple[str, str, QueueJob]] = []
+        if self._active_job is not None:
+            rows.append((str(self._active_job.job_id), "Running", self._active_job))
+        for j in self._queue:
+            rows.append((str(j.job_id), "Queued", j))
+
+        self.tbl_queue.setRowCount(len(rows))
+        for r, (jid, status, j) in enumerate(rows):
+            def _it(txt: str):
+                it = QtWidgets.QTableWidgetItem(txt)
+                it.setData(QtCore.Qt.UserRole, j.job_id)
+                return it
+
+            self.tbl_queue.setItem(r, 0, _it(jid))
+            self.tbl_queue.setItem(r, 1, _it(status))
+            self.tbl_queue.setItem(r, 2, _it(str(max(1, int(j.batch_size or 1)))))
+            self.tbl_queue.setItem(r, 3, _it(str(j.task_type or "")))
+            self.tbl_queue.setItem(r, 4, _it(f"{float(j.duration_s or 0.0):.1f}s" if j.duration_s else ""))
+            self.tbl_queue.setItem(r, 5, _it(str(j.seed or "")))
+            self.tbl_queue.setItem(r, 6, _it(str(j.title or "")))
+
+
+        # Mark refresh time
+        try:
+            self._queue_last_ui_refresh = now
+        except Exception:
+            pass
+
+        # Restore selection if possible
+        if selected_job_id is not None:
+            try:
+                for r in range(self.tbl_queue.rowCount()):
+                    it0 = self.tbl_queue.item(r, 0)
+                    if it0 is not None and it0.data(QtCore.Qt.UserRole) == selected_job_id:
+                        self.tbl_queue.selectRow(r)
+                        break
+            except Exception:
+                pass
+
+        try:
+            self.btn_queue_start_next.setEnabled((not self._is_running()) and len(self._queue) > 0)
+            self.btn_queue_clear.setEnabled(len(self._queue) > 0)
+        except Exception:
+            pass
+
+    def _queue_enqueue(self, job: QueueJob) -> None:
+        self._queue.append(job)
+        self._queue_refresh_ui(force=True)
+
+    def _queue_clear(self) -> None:
+        self._queue.clear()
+        self._queue_refresh_ui(force=True)
+
+    def _queue_remove_selected(self) -> None:
+        try:
+            sel = self.tbl_queue.selectionModel().selectedRows()
+            if not sel:
+                return
+            row = int(sel[0].row())
+        except Exception:
+            return
+
+        # Row 0 may be the running job.
+        if self._active_job is not None and row == 0:
+            self._log("Can't remove the running job. Use Stop if you want to cancel it.")
+            return
+
+        # Map row -> queue index
+        qi = row
+        if self._active_job is not None:
+            qi -= 1
+        if 0 <= qi < len(self._queue):
+            j = self._queue.pop(qi)
+            self._log(f"Removed job #{j.job_id} from queue")
+        self._queue_refresh_ui(force=True)
+
+
+    def _queue_remove_row(self, row: int) -> None:
+        """Remove a queued (pending) job at a specific visible row."""
+        # Row 0 may be the running job.
+        if self._active_job is not None and row == 0:
+            return
+        qi = row
+        if self._active_job is not None:
+            qi -= 1
+        if 0 <= qi < len(self._queue):
+            j = self._queue.pop(qi)
+            self._log(f"Removed job #{j.job_id} from queue")
+        self._queue_refresh_ui(force=True)
+
+    def _queue_context_menu(self, pos: QtCore.QPoint) -> None:
+        row = self.tbl_queue.rowAt(pos.y())
+        if row < 0:
+            return
+
+        menu = QtWidgets.QMenu(self.tbl_queue)
+
+        is_running_row = (self._active_job is not None and row == 0)
+        if is_running_row:
+            act = menu.addAction("Cancel job")
+            def _do_cancel():
+                if self._active_job is not None:
+                    self._log(f"Cancel requested for job #{self._active_job.job_id}")
+                self._stop()
+            act.triggered.connect(_do_cancel)
+        else:
+            act = menu.addAction("Remove from queue")
+            act.triggered.connect(lambda: self._queue_remove_row(row))
+
+        menu.exec(self.tbl_queue.viewport().mapToGlobal(pos))
+
+
+    def _queue_start_next(self) -> None:
+        if self._is_running():
+            return
+        self._queue_pump(force=True)
+
+    def _queue_pump(self, force: bool = False) -> None:
+        """Start the next queued job if we're idle."""
+        if self._is_running() and not force:
+            self._queue_refresh_ui(force=True)
+            return
+        if not self._queue:
+            self._queue_refresh_ui(force=True)
+            return
+
+        # Peek the next job. If it can't start (e.g. API server not ready), keep it queued.
+        job = self._queue[0]
+        ok = self._start_job(job)
+        if ok:
+            self._queue.pop(0)
+        self._queue_refresh_ui(force=True)
+
+    def _on_generate_clicked(self) -> None:
+        job = self._build_job_from_ui()
+        if job is None:
+            return
+
+        if self._is_running():
+            self._queue_enqueue(job)
+            try:
+                self.tabs.setCurrentIndex(1)  # Queue tab
+            except Exception:
+                pass
+            self._log(f"Queued job #{job.job_id} (tracks: {job.batch_size}).")
+            return
+
+        # Start immediately.
+        self._start_job(job)
+        self._queue_refresh_ui(force=True)
+
+    def _start_job(self, job: QueueJob) -> bool:
+        """Start a job. Returns True if started, False if we should retry later."""
+
+        # Keep in VRAM: ensure server is ready before starting.
+        if job.use_api:
+            self._ensure_api_server_started()
+            if not self._is_api_ready():
+                try:
+                    self.lbl_status.setText("Starting server…")
+                except Exception:
+                    pass
+                self._log("[Keep in VRAM] Server is still starting. Job will begin when ready.")
+                return False
+
+        self._active_job = job
+
+        # Snapshot outputs just before the run so we can identify what's new.
+        try:
+            self._ace15_out_snapshot = {str(p.resolve()) for p in list_audio_files(job.out_dir)}
+        except Exception:
+            self._ace15_out_snapshot = set()
+        self._ace15_run_started_epoch = time.time()
+
+        # Remember run context for post-run housekeeping.
+        self._last_out_dir = job.out_dir
+        self._last_cfg_path = job.cfg_path
+        try:
+            self._last_proj_root = Path(self.ed_projectroot.text().strip())
+        except Exception:
+            self._last_proj_root = None
+
+        self._set_busy(True)
+        self.lbl_status.setText("Running…")
+
+        self._thread = QtCore.QThread()
+
+        if job.use_api:
+            if self._api_server is None or not self._api_server.is_running():
+                self._set_busy(False)
+                self.lbl_status.setText("Idle")
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "API server not running",
+                    "Keep in VRAM is enabled, but the API server could not be started.\n"
+                    "Check the log for details, or disable 'Keep in VRAM (needs restart)'.",
+                )
+                self._active_job = None
+                return False
+
+            if not self._api_server.wait_until_ready(timeout_sec=20.0):
+                self._set_busy(False)
+                self.lbl_status.setText("Idle")
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "API server not ready",
+                    "The API server process started, but it did not become reachable on the configured port.\n"
+                    "Check the log output above for errors, or disable 'Keep in VRAM (needs restart)'.",
+                )
+                self._active_job = None
+                return False
+
+            payload = dict(job.api_payload or {})
+            self._runner = ApiRunner(base_url=self._api_server.base_url, payload=payload, output_dir=job.out_dir)
+        else:
+            if not job.cli_args or not job.cli_cwd:
+                self._log("Internal error: queued CLI job is missing args/cwd")
+                self._active_job = None
+                self._set_busy(False)
+                self.lbl_status.setText("Idle")
+                return False
+            self._runner = Runner(args=job.cli_args, cwd=job.cli_cwd, hide_console=False)
 
         self._runner.moveToThread(self._thread)
         self._thread.started.connect(self._runner.run)
         self._runner.log.connect(self._log)
         self._runner.finished.connect(self._done)
         self._thread.start()
+        return True
+
+    def _start(self):
+        """Backward compat: some integrations may still call _start()."""
+        self._on_generate_clicked()
 
     def _stop(self):
         if self._runner:
@@ -4013,6 +4417,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _done(self, code: int):
         self._log(f"Finished with exit code {code}")
         self.lbl_status.setText(f"Done (code {code})" if code != 0 else "Done")
+        # Keep a reference to the runner for post-processing (we clear self._runner below).
+        runner_ref = self._runner
+
         self._set_busy(False)
 
         if self._thread:
@@ -4024,7 +4431,28 @@ class MainWindow(QtWidgets.QMainWindow):
         # Post-process: rename newly generated outputs to a human-friendly name.
         try:
             if code == 0:
-                self._ace15_rename_new_outputs()
+                j = self._active_job
+                if j is not None:
+                    # If this was an API run, we may have per-output seeds.
+                    if j.use_api and isinstance(runner_ref, ApiRunner) and getattr(runner_ref, 'saved_outputs', None):
+                        self._ace15_rename_specific_outputs(
+                            outputs=list(getattr(runner_ref, 'saved_outputs', []) or []),
+                            out_dir=j.out_dir,
+                            subgenre=(j.subgenre_for_naming or self._ace15_pick_subgenre_for_naming()),
+                        )
+                    else:
+                        self._ace15_rename_new_outputs(
+                            out_dir=j.out_dir,
+                            subgenre=(j.subgenre_for_naming or self._ace15_pick_subgenre_for_naming()),
+                            seed_s=(j.seed or self._ace15_seed_for_naming()),
+                        )
+                else:
+                    # Fallback (should not normally happen)
+                    self._ace15_rename_new_outputs(
+                        out_dir=Path(self.ed_outdir.text().strip()),
+                        subgenre=self._ace15_pick_subgenre_for_naming(),
+                        seed_s=self._ace15_seed_for_naming(),
+                    )
         except Exception as e:
             self._log(f"NOTE: Could not rename outputs: {e!r}")
 
@@ -4039,6 +4467,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if False and code == 0:  # forced OFF (UI removed)
             self._open_output_folder()
+
+        # Clear active job and start next queued one (if any).
+        self._active_job = None
+        self._queue_refresh_ui()
+        # Pump immediately so it feels instant.
+        self._queue_pump(force=True)
 
     # -----------------------------
     # Output naming
@@ -4073,7 +4507,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if 2 <= len(first) <= 48 and all(c.isprintable() for c in first):
                     return first
         except Exception:
-            passs
+            pass
         return "Custom"
 
     def _ace15_seed_for_naming(self) -> str:
@@ -4082,8 +4516,62 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return "AUTO"
 
-    def _ace15_rename_new_outputs(self) -> None:
-        out_dir = Path(self.ed_outdir.text().strip())
+    def _ace15_rename_specific_outputs(
+        self,
+        *,
+        outputs: list[tuple[Path, Optional[int]]],
+        out_dir: Path,
+        subgenre: str,
+    ) -> None:
+        """Rename a known list of output files.
+
+        Used for API mode so each output can carry its *actual* per-output seed
+        (the API runner generates one seed per output when Random is enabled).
+        """
+        if not out_dir.exists() or not outputs:
+            return
+
+        subgenre = self._ace15_sanitize_filename_part(subgenre) or "Custom"
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+        renamed_any = False
+        for idx, (src, seed_int) in enumerate(outputs, start=1):
+            try:
+                src = Path(src)
+            except Exception:
+                continue
+            if not src.exists():
+                continue
+
+            ext = src.suffix or ""
+            seed_s = self._ace15_sanitize_filename_part(str(seed_int) if seed_int is not None else self._ace15_seed_for_naming()) or "AUTO"
+            counter = f"_{idx}" if len(outputs) > 1 else ""
+            base = f"{subgenre}__seed{seed_s}__{stamp}{counter}{ext}"
+            dst = out_dir / base
+
+            if dst.exists():
+                i = 2
+                while True:
+                    cand = out_dir / f"{dst.stem}_{i}{dst.suffix}"
+                    if not cand.exists():
+                        dst = cand
+                        break
+                    i += 1
+
+            try:
+                src.rename(dst)
+                renamed_any = True
+                self._log(f"Renamed output: {src.name} -> {dst.name}")
+            except Exception as e:
+                self._log(f"NOTE: Could not rename '{src.name}': {e!r}")
+
+        if renamed_any:
+            try:
+                self._ace15_out_snapshot = {str(p.resolve()) for p in list_audio_files(out_dir)}
+            except Exception:
+                pass
+
+    def _ace15_rename_new_outputs(self, *, out_dir: Path, subgenre: str, seed_s: str) -> None:
         if not out_dir.exists():
             return
 
@@ -4097,7 +4585,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if str(p.resolve()) not in snap:
                         new_files.append(p)
                 except Exception:
-                    passs
+                    pass
         if not new_files:
             started = float(self._ace15_run_started_epoch or 0.0)
             if started > 0:
@@ -4106,7 +4594,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         if p.stat().st_mtime >= (started - 2.0):
                             new_files.append(p)
                     except Exception:
-                        passs
+                        pass
 
         if not new_files:
             return
@@ -4118,8 +4606,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 return 0.0
         new_files = sorted(new_files, key=_mtime)
 
-        subgenre = self._ace15_sanitize_filename_part(self._ace15_pick_subgenre_for_naming()) or "Custom"
-        seed_s = self._ace15_sanitize_filename_part(self._ace15_seed_for_naming()) or "AUTO"
+        subgenre = self._ace15_sanitize_filename_part(subgenre) or "Custom"
+        seed_s = self._ace15_sanitize_filename_part(seed_s) or "AUTO"
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
         renamed_any = False
@@ -4149,7 +4637,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self._ace15_out_snapshot = {str(p.resolve()) for p in list_audio_files(out_dir)}
             except Exception:
-                passs
+                pass
 
     def _move_instruction_txt_to_output(self, exit_code: int) -> None:
         proj = self._last_proj_root
@@ -4191,7 +4679,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(f"NOTE: Moved repo instruction.txt -> {dst}")
 
     def _set_busy(self, busy: bool):
-        self.btn_run.setEnabled(not busy)
+        # Generate stays enabled while running so clicks can enqueue new jobs.
+        try:
+            self.btn_run.setEnabled(True)
+        except Exception:
+            pass
         self.btn_stop.setEnabled(busy)
 
         try:
@@ -4201,7 +4693,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._spin_frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
                 # Initial state
-                self.btn_run.setText(f"Generating {self._spin_frames[0]}")
+                self.btn_run.setText(f"Generating {self._spin_frames[0]}  (click to queue)")
 
                 # Banner: text + indeterminate progress bar (nicer than braille)
                 try:
@@ -4274,11 +4766,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.lbl_preview_now.setText(f"{path.name}")
         except Exception:
-            passs
+            pass
         try:
             self.btn_preview_open.setEnabled(True)
         except Exception:
-            passs
+            pass
 
         if self._preview_player is None:
             # QtMultimedia not available – still allow 'Open file'.
@@ -4288,7 +4780,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.sld_preview.setEnabled(False)
                 self.lbl_preview_time.setText("0:00 / 0:00")
             except Exception:
-                passs
+                pass
             return
 
         try:
@@ -4302,13 +4794,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_preview_stop.setEnabled(True)
             self.sld_preview.setEnabled(True)
         except Exception:
-            passs
+            pass
 
         if autoplay:
             try:
                 self._preview_player.play()
             except Exception:
-                passs
+                pass
 
     def _preview_toggle_play(self) -> None:
         if self._preview_player is None:
@@ -4320,7 +4812,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._preview_player.play()
         except Exception:
-            passs
+            pass
 
     def _preview_stop(self) -> None:
         if self._preview_player is None:
@@ -4328,7 +4820,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._preview_player.stop()
         except Exception:
-            passs
+            pass
 
     def _preview_open_file(self) -> None:
         p = getattr(self, "_preview_path", None)
@@ -4339,7 +4831,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if p.exists():
                 open_in_explorer(p)
         except Exception:
-            passs
+            pass
 
     def _preview_slider_pressed(self) -> None:
         self._preview_dragging = True
@@ -4362,7 +4854,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pos = int(dur * frac)
             self._preview_player.setPosition(pos)
         except Exception:
-            passs
+            pass
 
     def _preview_on_position_changed(self, _pos: int) -> None:
         if self._preview_dragging:
@@ -4375,7 +4867,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.sld_preview.setValue(int((pos / dur) * 1000.0))
                 self.sld_preview.blockSignals(False)
         except Exception:
-            passs
+            pass
         self._preview_update_time_label(from_slider=False)
 
     def _preview_on_duration_changed(self, _dur: int) -> None:
@@ -4388,7 +4880,7 @@ class MainWindow(QtWidgets.QMainWindow):
             st = self._preview_player.playbackState()
             self.btn_preview_play.setText("Pause" if st == QtMultimedia.QMediaPlayer.PlayingState else "Play")
         except Exception:
-            passs
+            pass
 
     @staticmethod
     def _preview_fmt_ms(ms: int) -> str:
@@ -4412,7 +4904,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pos = int(self._preview_player.position() or 0)
             self.lbl_preview_time.setText(f"{self._preview_fmt_ms(pos)} / {self._preview_fmt_ms(dur)}")
         except Exception:
-            passs
+            pass
 
 
     def _toggle_wheel_guard(self, enabled: bool):
@@ -4422,14 +4914,14 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 uninstall_no_wheel_guard()
         except Exception:
-            passs
+            pass
 
         # Persist
         try:
             self.settings.wheel_guard_enabled = bool(enabled)
             self._save_settings()
         except Exception:
-            passs
+            pass
 
 
 
@@ -4438,7 +4930,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.settings.banner_enabled = bool(enabled)
         except Exception:
-            passs
+            pass
 
         try:
             if hasattr(self, "banner"):
@@ -4446,12 +4938,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "banner_gap"):
                 self.banner_gap.setVisible(bool(enabled))
         except Exception:
-            passs
+            pass
 
         try:
             self._save_settings()
         except Exception:
-            passs
+            pass
     def _on_update_clicked(self):
         """Check GitHub repo for newer/changed files and optionally apply them."""
         try:
@@ -4647,7 +5139,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     shutil.copy2(dst, bdst)
                 except Exception:
-                    passs
+                    pass
 
             with open(dst, 'wb') as f:
                 f.write(data)
@@ -4667,12 +5159,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if getattr(self, "_preview_player", None) is not None:
                 self._preview_player.stop()
         except Exception:
-            passs
+            pass
         # Stop generation if running
         try:
             self._stop()
         except Exception:
-            passs
+            pass
         return super().closeEvent(e)
 
 
@@ -4716,7 +5208,7 @@ class AceStep15Pane(QtWidgets.QWidget):
         try:
             cw.setParent(self)
         except Exception:
-            passs
+            pass
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -4728,7 +5220,7 @@ class AceStep15Pane(QtWidgets.QWidget):
             if hasattr(self._mw, '_stop_run'):
                 self._mw._stop_run()
         except Exception:
-            passs
+            pass
         return super().closeEvent(e)
 
 
