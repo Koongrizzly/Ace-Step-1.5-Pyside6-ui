@@ -48,7 +48,6 @@ How to add a preset ? It wll first ask for the main genre (eg 'Rock', next it as
 ---
 
 ## 🛠️ Todo :
-- toggle to keep the model in vram for faster generation
 - try to fix flash & nano-vllm when i find the time
 - Add more functions /updates
 
