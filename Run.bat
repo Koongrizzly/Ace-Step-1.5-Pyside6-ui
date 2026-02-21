@@ -18,4 +18,4 @@ echo.
 
 "%PY%" "%APP_ROOT%\helpers\ace_step_15.py"
 echo.
-pause
+
