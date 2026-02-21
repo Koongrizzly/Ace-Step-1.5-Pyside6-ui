@@ -119,7 +119,7 @@ def patch_ace_pyproject_windows_compat(repo_dir: Path) -> None:
     original = s
 
     # Drop specific problematic deps
-    for dep in ("nano-vllm", "gradio", "fastapi"):
+    for dep in ("nano-vllm", "gradio"):
         s = re.sub(r'\n\s*"' + re.escape(dep) + r'[^"]*"\s*,?\s*', "\n", s)
 
     # Drop strict torch/vision/audio pins with CUDA local version markers
@@ -296,7 +296,6 @@ def main() -> int:
         # best-effort torch install (cu128 index)
         run(vpip + ["install", "--index-url", TORCH_INDEX_CU129, "torch", "torchvision", "torchaudio"], env=env)
         run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU129, "-e", "."], cwd=repo_dir, env=env)
-
     # 4b) Stabilize Diffusers/TorchAO on Windows.
     # Recent Diffusers releases introduced a TorchAO quantizer import path that can crash at import-time
     # when torchao is present but incompatible (e.g., torchao 0.16.x with torch 2.8.0+cu129),
@@ -313,7 +312,7 @@ def main() -> int:
         except Exception:
             pass
         # Pin to a known-good pre-0.36 series to avoid the logger bug.
-        run(vpip + ["install", "--upgrade", "--force-reinstall", "diffusers==0.35.1"], env=env)
+        run(vpip + ["install", "--upgrade", "--force-reinstall", "diffusers==0.35.1", "huggingface-hub==0.35.1"], env=env)
 
 
         # Transformers in ACE-Step expects huggingface-hub < 1.0. Some installs accidentally pull hub 1.x,
@@ -334,7 +333,14 @@ def main() -> int:
     log("[STEP] Downloading models (base always; LM optional)...")
     download_models(root, vpy, lm_choice, env)
 
-    # 6) headless verify
+    
+    # 6a) API server deps (for warm VRAM mode via localhost HTTP, no browser UI)
+    # Install with --no-deps to avoid disturbing pinned HF/Diffusers/Numpy versions.
+    log("[STEP] Installing API server dependencies (FastAPI)...")
+    run(vpip + ["install", "--upgrade", "--no-deps",
+                "fastapi==0.115.6", "starlette==0.41.3", "python-multipart==0.0.22"], env=env)
+
+# 6) headless verify
     log("[STEP] Headless verification (no Gradio)...")
     verify(root, vpy, env)
 
