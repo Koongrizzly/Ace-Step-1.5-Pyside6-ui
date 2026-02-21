@@ -5306,7 +5306,7 @@ class MainWindow(QtWidgets.QMainWindow):
         title.setWordWrap(True)
         v.addWidget(title)
 
-        info = QtWidgets.QLabel("The app needs restart after applying updates.")
+        info = QtWidgets.QLabel("The app needs restart after applying updates, Do NOT select presetmanager.json if you don't want your genre presets to be reset to default")
         info.setWordWrap(True)
         v.addWidget(info)
 
