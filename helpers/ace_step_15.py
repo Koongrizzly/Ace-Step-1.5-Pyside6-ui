@@ -898,6 +898,32 @@ class Settings:
             pass
         return d
 
+    @staticmethod
+    def from_dict(d: dict) -> "Settings":
+        """Deserialize Settings from a dict.
+
+        Accepts unknown keys (future-proof) and keeps defaults for missing ones.
+        """
+        s = Settings()
+        if not isinstance(d, dict):
+            return s
+
+        # Apply declared fields
+        for k in getattr(Settings, "__annotations__", {}).keys():
+            if k in d:
+                try:
+                    setattr(s, k, d.get(k))
+                except Exception:
+                    pass
+
+        # Preserve any extra keys the app might have saved
+        for k, v in d.items():
+            if not hasattr(s, k):
+                try:
+                    setattr(s, k, v)
+                except Exception:
+                    pass
+        return s
 
 @dataclass
 class QueueJob:
