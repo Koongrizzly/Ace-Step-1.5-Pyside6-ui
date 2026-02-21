@@ -40,6 +40,7 @@ import sys
 import time
 import io
 import json
+import re
 import random
 import shlex
 import subprocess
@@ -156,6 +157,8 @@ except Exception:
 
 APP_TITLE = "Ace-Step 1.5 — Music Creator"
 SETTINGS_JSON = "ace_step_15_ui.settings.json"
+SETTINGS_PATH_POINTER_JSON = "ace_step_15_ui.settings_path.json"  # remembers last settings file location
+
 
 # Preset Manager
 ACE15_PRESET_MANAGER_JSON = "presetmanager.json"
@@ -223,6 +226,36 @@ def settings_path_for_root(framevision_root: Path) -> Path:
 
 def preset_manager_path_for_root(framevision_root: Path) -> Path:
     return framevision_root / "presets" / "setsave" / "ace15presets" / ACE15_PRESET_MANAGER_JSON
+
+def settings_pointer_path(framevision_root: Path) -> Path:
+    """Pointer file stored under presets/setsave (so nothing is written into helpers)."""
+    return framevision_root / "presets" / "setsave" / SETTINGS_PATH_POINTER_JSON
+
+
+def read_last_settings_path(framevision_root: Path) -> Optional[Path]:
+    try:
+        p = settings_pointer_path(framevision_root)
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        sp = str(data.get("settings_path") or "").strip()
+        if not sp:
+            return None
+        spath = Path(sp)
+        return spath if spath.exists() else None
+    except Exception:
+        return None
+
+
+def write_last_settings_path(framevision_root: Path, settings_path: Path) -> None:
+    try:
+        p = settings_pointer_path(framevision_root)
+        ensure_dir(p.parent)
+        p.write_text(json.dumps({"settings_path": str(settings_path)}, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 
 
 def _ace15_default_preset_manager_data() -> dict:
@@ -821,6 +854,9 @@ class Settings:
     offload_to_cpu: bool = False
     offload_dit_to_cpu: bool = False
     use_flash_attention: bool = False
+    # If enabled, the UI will use the FastAPI server workflow (keeps models in VRAM).
+    # Requires restart to take effect.
+    keep_in_vram: bool = False
     main_model_path: str = ""
     lm_model_path: str = ""
     lm_enhance: bool = False
@@ -839,7 +875,20 @@ class Settings:
     inference_steps: int = 0     # 0 = default/auto
 
     def to_dict(self) -> dict:
-        return self.__dict__.copy()
+        d: dict = {}
+        # Persist all declared fields, even if they were never assigned on the instance.
+        for k in getattr(Settings, '__annotations__', {}).keys():
+            try:
+                d[k] = getattr(self, k)
+            except Exception:
+                pass
+        # Also include any dynamic instance attributes.
+        try:
+            for k, v in self.__dict__.items():
+                d[k] = v
+        except Exception:
+            pass
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> "Settings":
@@ -861,6 +910,7 @@ class Runner(QtCore.QObject):
         self.cwd = cwd
         self.hide_console = hide_console
         self._proc: Optional[subprocess.Popen] = None
+        self._ready_flag: bool = False
         self._stop = False
 
     @QtCore.Slot()
@@ -929,7 +979,434 @@ class Runner(QtCore.QObject):
         self._stop = True
 
 
+class ApiServerManager(QtCore.QObject):
+    """Launch and monitor ACE-Step FastAPI server.
 
+    This is used by the "Keep in VRAM" workflow so models stay resident across runs.
+    """
+
+    log = QtCore.Signal(str)
+    ready = QtCore.Signal()
+
+    def __init__(self, env_python: Path, project_root: Path, host: str = "127.0.0.1", port: int = 8001):
+        super().__init__()
+        self.env_python = env_python
+        self.project_root = project_root
+        self.host = host
+        self.port = port
+        self._proc: Optional[subprocess.Popen] = None
+        self._stop = False
+        self._reader_thread: Optional[QtCore.QThread] = None
+        self._reader_obj: Optional[_ApiLogReader] = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def is_running(self) -> bool:
+        return self._proc is not None and (self._proc.poll() is None)
+
+
+    def _ensure_headless_api_server(self, api_server_py: Path) -> Path:
+        """Create a gradio-free copy of api_server.py and return its path.
+
+        The upstream ACE-Step api_server.py imports a helper from acestep.ui.gradio.* which
+        pulls in the gradio dependency via package __init__.py. For the PySide workflow
+        we don't want to require gradio, so we generate a headless variant next to it.
+        """
+        headless_py = api_server_py.with_name("api_server_headless.py")
+        try:
+            src = api_server_py.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            self.log.emit(f"[Keep in VRAM] Failed to read api_server.py: {e}")
+            return api_server_py
+
+        # If upstream already doesn't depend on gradio, use it as-is
+        if "acestep.ui.gradio" not in src:
+            return api_server_py
+
+        # Reuse generated file if it's newer than upstream
+        try:
+            if headless_py.exists() and headless_py.stat().st_mtime >= api_server_py.stat().st_mtime:
+                return headless_py
+        except Exception:
+            pass
+
+        patched = src
+
+        # 1) Replace the gradio results_handlers import with a local headless helper.
+        #    We must NOT inject inside a multi-line import (...) block, so we patch in-place.
+        helper = """# --- Headless generation info (gradio-free; generated by PySide UI) --------
+
+from typing import Optional, Any, Dict
+
+def _build_generation_info_headless(
+    lm_metadata: Any = None,
+    time_costs: Optional[Dict[str, Any]] = None,
+    seed_value: Optional[str] = None,
+    inference_steps: Optional[int] = None,
+    num_audios: int = 1,
+) -> str:
+    \"""Return a short, human-readable summary without importing gradio.\""" 
+    try:
+        tc = time_costs or {}
+        if not isinstance(tc, dict):
+            return ""
+        n = int(num_audios or 0)
+        lm_total = float(tc.get("lm_total_time", 0.0) or 0.0)
+        dit_total = float(tc.get("dit_total_time_cost", 0.0) or 0.0)
+        total = lm_total + dit_total
+        if total <= 0 or n <= 0:
+            return ""
+        avg = total / max(1, n)
+        seed_part = f" seed={seed_value}" if seed_value else ""
+        steps_part = f" steps={inference_steps}" if inference_steps else ""
+        return f"Total: {total:.2f}s ({n} audio{'s' if n != 1 else ''}, avg {avg:.2f}s){seed_part}{steps_part}"
+    except Exception:
+        return ""
+
+# ------------------------------------------------------------------------
+"""
+
+        patched = re.sub(
+            r"^from\s+acestep\.ui\.gradio\.events\.results_handlers\s+import\s+_build_generation_info\s*$",
+            helper,
+            patched,
+            flags=re.MULTILINE,
+        )
+
+        # 2) Replace calls to the helper with our headless helper name
+        patched = patched.replace("_build_generation_info(", "_build_generation_info_headless(")
+        # 3) Avoid uvicorn importing the original gradio-dependent module.
+        #    Upstream uses uvicorn.run("acestep.api_server:app", ...) which would re-import api_server.py.
+        #    When running the generated headless file, pass the app object directly instead.
+        patched = re.sub(
+            r'uvicorn\.run\(\s*["\']acestep\.api_server:app["\']\s*,',
+            'uvicorn.run(app,',
+            patched,
+        )
+        patched = re.sub(
+            r'uvicorn\.run\(\s*["\']acestep\.api_server:app["\']\s*\)',
+            'uvicorn.run(app)',
+            patched,
+        )
+
+        try:
+            headless_py.write_text(patched, encoding="utf-8", errors="replace")
+            self.log.emit(f"[Keep in VRAM] Generated headless API server: {headless_py}")
+            return headless_py
+        except Exception as e:
+            self.log.emit(f"[Keep in VRAM] Failed to write headless API server: {e}")
+            return api_server_py
+
+    def start(self, lm_model: str = "") -> None:
+        if self.is_running():
+            return
+        self._ready_flag = False
+
+        api_server_py = self.project_root / "acestep" / "api_server.py"
+        if not api_server_py.exists():
+            self.log.emit(
+                "[Keep in VRAM] api_server.py not found under project_root/acestep/. "
+                "Disable 'Keep in VRAM' or install the full ACE-Step repo."
+            )
+            return
+
+        api_server_py = self._ensure_headless_api_server(api_server_py)
+
+        args = [
+            str(self.env_python),
+            str(api_server_py),
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+        ]
+
+        try:
+            self._proc = subprocess.Popen(
+                args,
+                cwd=str(self.project_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            self.log.emit(f"[Keep in VRAM] Failed to start API server: {e!r}")
+            self._proc = None
+            return
+
+        self._stop = False
+
+        # Reader thread that streams server logs into the UI.
+        self._reader_thread = QtCore.QThread()
+        reader = _ApiLogReader(self._proc)
+        self._reader_obj = reader
+        reader.moveToThread(self._reader_thread)
+        self._reader_thread.started.connect(reader.run)
+        reader.log.connect(self.log)
+        reader.ready.connect(self._mark_ready)
+        reader.finished.connect(self._reader_thread.quit)
+        reader.finished.connect(reader.deleteLater)
+        self._reader_thread.finished.connect(self._reader_thread.deleteLater)
+        self._reader_thread.start()
+
+    
+    def _mark_ready(self) -> None:
+        self._ready_flag = True
+        try:
+            self.ready.emit()
+        except Exception:
+            pass
+
+    def wait_until_ready(self, timeout_sec: float = 15.0) -> bool:
+        """Wait until the API server is reachable on HTTP (best effort)."""
+        if not self.is_running():
+            return False
+        # If the log reader already detected readiness, we're done.
+        if self._ready_flag:
+            return True
+
+        deadline = time.time() + float(timeout_sec)
+        url = self.base_url + "/openapi.json"
+        while time.time() < deadline:
+            if not self.is_running():
+                return False
+            if self._ready_flag:
+                return True
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, headers={"User-Agent": "Ace15UI"})
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if 200 <= int(getattr(resp, "status", 200)) < 500:
+                        self._ready_flag = True
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return False
+
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            if self._proc is not None and self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5)
+                except Exception:
+                    self._proc.kill()
+        except Exception:
+            pass
+        self._reader_obj = None
+        self._proc = None
+
+
+class _ApiLogReader(QtCore.QObject):
+    log = QtCore.Signal(str)
+    ready = QtCore.Signal()
+    finished = QtCore.Signal()
+
+    def __init__(self, proc: subprocess.Popen):
+        super().__init__()
+        self.proc = proc
+        self._ready_emitted = False
+
+    def run(self):
+        try:
+            if self.proc.stdout is None:
+                return
+            for line in self.proc.stdout:
+                s = (line or "").rstrip("\n")
+                if s:
+                    self.log.emit(s)
+                # Best-effort readiness detection: uvicorn prints "Uvicorn running on".
+                if (not self._ready_emitted) and ("Uvicorn running on" in s or "Application startup complete" in s):
+                    self._ready_emitted = True
+                    self.ready.emit()
+            try:
+                rc = self.proc.wait(timeout=0.1)
+                self.log.emit(f"[Keep in VRAM] API server exited (code {rc})")
+            except Exception:
+                pass
+        finally:
+            self.finished.emit()
+
+
+class ApiRunner(QtCore.QObject):
+    """Run a single generation via the local API server."""
+
+    log = QtCore.Signal(str)
+    started = QtCore.Signal()
+    finished = QtCore.Signal(int)
+
+    def __init__(self, base_url: str, payload: dict, output_dir: Path, timeout_s: float = 3600.0):
+        super().__init__()
+        self.base_url = base_url.rstrip("/")
+        self.payload = payload
+        self.output_dir = output_dir
+        self.timeout_s = timeout_s
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _http_json(self, path: str, data: dict) -> dict:
+        import urllib.request
+        req = urllib.request.Request(
+            self.base_url + path,
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"_raw": raw}
+
+    def _http_get_bytes(self, url: str) -> bytes:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            return resp.read()
+
+    def run(self):
+        self.started.emit()
+        t0 = time.time()
+        try:
+            # The API server *can* accept batch_size>1, but it may reduce batch_size internally
+            # under VRAM pressure (and then only return 1 audio). To ensure the UI honors the
+            # user's requested "Batch/Outputs", we submit N single-audio jobs sequentially.
+            try:
+                requested_n = int(self.payload.get("batch_size", 1) or 1)
+            except Exception:
+                requested_n = 1
+            if requested_n < 1:
+                requested_n = 1
+
+            base_payload = dict(self.payload)
+            base_seed = None
+            try:
+                base_seed = int(base_payload.get("seed")) if base_payload.get("seed") is not None else None
+            except Exception:
+                base_seed = None
+            use_random_seed = bool(base_payload.get("use_random_seed", False))
+
+            # Always run API jobs as single-output to guarantee we get N files.
+            base_payload["batch_size"] = 1
+
+            saved_paths = []
+            for i in range(requested_n):
+                if self._stop:
+                    self.log.emit("[Keep in VRAM] Stopped.")
+                    self.finished.emit(5)
+                    return
+
+                payload = dict(base_payload)
+
+                # Seed strategy:
+                # - If random seeds enabled -> new random seed per output.
+                # - Else -> deterministic: base_seed + i (if base_seed exists).
+                if use_random_seed:
+                    try:
+                        payload["seed"] = random.randint(0, 2**32 - 1)
+                    except Exception:
+                        payload["seed"] = int(time.time() * 1000) & 0xFFFFFFFF
+                    payload["use_random_seed"] = False
+                else:
+                    if base_seed is not None:
+                        payload["seed"] = int(base_seed + i)
+                        payload["use_random_seed"] = False
+
+                self.log.emit(f"[Keep in VRAM] Submitting task to API server... ({i+1}/{requested_n})")
+                r = self._http_json("/release_task", payload)
+                data = r.get("data") if isinstance(r, dict) else None
+                if not isinstance(data, dict) or not data.get("task_id"):
+                    self.log.emit(f"[Keep in VRAM] Unexpected /release_task response: {r!r}")
+                    self.finished.emit(1)
+                    return
+                task_id = str(data["task_id"])
+                self.log.emit(f"[Keep in VRAM] Task queued: {task_id}")
+
+                # Poll until finished.
+                last_progress = ""
+                while not self._stop:
+                    if (time.time() - t0) > self.timeout_s:
+                        self.log.emit("[Keep in VRAM] Timeout waiting for task result")
+                        self.finished.emit(2)
+                        return
+                    qr = self._http_json("/query_result", {"task_id_list": [task_id]})
+                    qd = qr.get("data") if isinstance(qr, dict) else None
+                    if isinstance(qd, list) and qd:
+                        item = qd[0] if isinstance(qd[0], dict) else {}
+                        status = int(item.get("status", 0) or 0)
+                        ptxt = str(item.get("progress_text") or "").strip()
+                        if ptxt and ptxt != last_progress:
+                            last_progress = ptxt
+                            self.log.emit(f"[Keep in VRAM] {ptxt}")
+
+                        if status == 1:
+                            # Success. Parse result JSON (string).
+                            res_str = item.get("result", "[]")
+                            try:
+                                res_list = json.loads(res_str) if isinstance(res_str, str) else res_str
+                            except Exception:
+                                res_list = []
+
+                            file_urls = []
+                            if isinstance(res_list, list):
+                                for rr in res_list:
+                                    if isinstance(rr, dict):
+                                        fu = str(rr.get("file") or "").strip()
+                                        if fu:
+                                            file_urls.append(fu)
+
+                            if not file_urls:
+                                self.log.emit("[Keep in VRAM] Task succeeded but no audio file URL found.")
+                                self.finished.emit(3)
+                                return
+
+                            # Download all returned files into output folder.
+                            ensure_dir(self.output_dir)
+                            stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                            ext = (payload.get("audio_format") or "mp3").strip() or "mp3"
+
+                            for j, file_url in enumerate(file_urls):
+                                full_url = file_url
+                                if full_url.startswith("/"):
+                                    full_url = self.base_url + full_url
+                                self.log.emit(f"[Keep in VRAM] Downloading audio... ({i+1}/{requested_n}, file {j+1}/{len(file_urls)})")
+                                audio_bytes = self._http_get_bytes(full_url)
+
+                                # Name: ace15_api_<timestamp>_<index>.<ext> when multiple outputs.
+                                suffix = ""
+                                if requested_n > 1 or len(file_urls) > 1:
+                                    suffix = f"_{i+1:02d}"
+                                    if len(file_urls) > 1:
+                                        suffix += f"_{j+1:02d}"
+                                out_path = self.output_dir / f"ace15_api_{stamp}{suffix}.{ext}"
+                                out_path.write_bytes(audio_bytes)
+                                saved_paths.append(out_path)
+                                self.log.emit(f"[Keep in VRAM] Saved: {out_path}")
+
+                            break  # done polling this task
+
+                        if status == 2:
+                            self.log.emit("[Keep in VRAM] Task failed")
+                            self.finished.emit(4)
+                            return
+
+                    time.sleep(0.8)
+
+            # All requested outputs done.
+            self.finished.emit(0)
+            return
+
+        except Exception as e:
+            self.log.emit(f"[Keep in VRAM] Error: {e!r}")
+            self.finished.emit(9)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -952,6 +1429,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._thread: Optional[QtCore.QThread] = None
         self._runner: Optional[Runner] = None
+
+        # Optional API server workflow ("Keep in VRAM")
+        self._api_server: Optional[ApiServerManager] = None
 
         # Generate button busy animation ("Generating…" with dots)
         self._gen_anim_timer: Optional[QtCore.QTimer] = None
@@ -985,6 +1465,40 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._refresh_outputs()
+
+        # If enabled, start the FastAPI server now so models stay resident in VRAM.
+        try:
+            if bool(getattr(self.settings, "keep_in_vram", False)):
+                self._ensure_api_server_started()
+        except Exception:
+            pass
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # Best-effort: stop API server on exit.
+        try:
+            if self._api_server is not None:
+                self._api_server.stop()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _ensure_api_server_started(self) -> None:
+        try:
+            envpy = Path(self.settings.env_python or "").expanduser()
+            proj = Path(self.settings.project_root or "").expanduser()
+            if not envpy.exists() or not proj.exists():
+                return
+            if self._api_server is None:
+                self._api_server = ApiServerManager(env_python=envpy, project_root=proj)
+                self._api_server.log.connect(self._log)
+                self._api_server.ready.connect(lambda: self._log("[Keep in VRAM] API server ready."))
+            if not self._api_server.is_running():
+                # Use the selected LM model if provided; server still decides whether to init it.
+                lm_model = str(getattr(self.settings, "lm_model_path", "") or "")
+                self._log("[Keep in VRAM] Starting API server...")
+                self._api_server.start(lm_model=lm_model)
+        except Exception:
+            pass
 
     def _tick_generate_anim(self) -> None:
         """Animate the Generate button text while a run is active."""
@@ -1702,9 +2216,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_offload_dit = QtWidgets.QCheckBox("Offload DiT to CPU")
         self.chk_flashattn = QtWidgets.QCheckBox("Use Flash Attention")
 
+        self.chk_keep_in_vram = QtWidgets.QCheckBox("Keep in VRAM (needs restart)")
+        self.chk_keep_in_vram.setToolTip(
+            "When enabled (after restarting the app), Ace-Step will start the local FastAPI server at launch\n"
+            "and generation will run via the API instead of spawning cli.py each time.\n"
+            "This keeps the model in VRAM between runs."
+        )
+        self.chk_keep_in_vram.toggled.connect(lambda _on: self._log("Keep in VRAM changed — restart required to take effect."))
+
         perf.addWidget(self.chk_offload_dit, 0, 0)
         perf.addWidget(self.chk_offload, 0, 1)
         perf.addWidget(self.chk_flashattn, 1, 0)
+        perf.addWidget(self.chk_keep_in_vram, 1, 1)
 
         adv_l.addWidget(gb_perf)
 
@@ -1841,7 +2364,12 @@ class MainWindow(QtWidgets.QMainWindow):
         s.project_root = str(default_ace_project_root(fv))
         load_path = self.settings_path
         legacy_path = Path(__file__).resolve().with_name(SETTINGS_JSON)
-        if not load_path.exists() and legacy_path.exists():
+        pointer_path = read_last_settings_path(self.fv_root_guess)
+        # Prefer the last-known settings file (if it exists), then the detected FV-root path,
+        # then the legacy file next to the script.
+        if pointer_path is not None:
+            load_path = pointer_path
+        elif not load_path.exists() and legacy_path.exists():
             load_path = legacy_path
         if load_path.exists():
             try:
@@ -2016,6 +2544,8 @@ class MainWindow(QtWidgets.QMainWindow):
         s.offload_to_cpu = self.chk_offload.isChecked()
         s.offload_dit_to_cpu = self.chk_offload_dit.isChecked()
         s.use_flash_attention = self.chk_flashattn.isChecked()
+        if hasattr(self, 'chk_keep_in_vram'):
+            s.keep_in_vram = bool(self.chk_keep_in_vram.isChecked())
 
         # Generation controls
         if hasattr(self, 'spin_guidance'):
@@ -2047,6 +2577,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_outdir.setText(s.output_dir)
         self.chk_hide_console.setChecked(False)  # forced OFF (UI removed)
         self.chk_auto_open.setChecked(False)  # forced OFF (UI removed)
+
+        if hasattr(self, 'chk_keep_in_vram'):
+            try:
+                self.chk_keep_in_vram.setChecked(bool(getattr(s, 'keep_in_vram', False)))
+            except Exception:
+                self.chk_keep_in_vram.setChecked(False)
 
         self._set_combo(self.cmb_task, s.task_type)
         self._set_combo(self.cmb_backend, s.backend)
@@ -2271,6 +2807,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.settings_path = settings_path_for_root(fv)
             ensure_dir(self.settings_path.parent)
             self.settings_path.write_text(json.dumps(self.settings.to_dict(), indent=2), encoding="utf-8")
+            # Remember this location for next launch (in case FV root auto-detection changes).
+            write_last_settings_path(self.fv_root_guess, self.settings_path)
             self._log(f"Saved settings: {self.settings_path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
@@ -3194,24 +3732,101 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_out_dir = out_dir
         self._last_cfg_path = cfg_path
 
+        # Choose workflow: CLI (default) or API server (Keep in VRAM).
+        use_api = bool(getattr(self.settings, 'keep_in_vram', False))
+
         envpy = Path(self.ed_envpy.text().strip())
-        clipy = Path(self.ed_clipypy.text().strip())
         proj = Path(self.ed_projectroot.text().strip())
         self._last_proj_root = proj
-
-        args = [str(envpy), str(clipy), "-c", str(cfg_path)]
 
         self._set_busy(True)
         self.lbl_status.setText("Running…")
 
         self._thread = QtCore.QThread()
-        self._runner = Runner(args=args, cwd=proj, hide_console=False)  # forced OFF (UI removed)
-        self._runner.moveToThread(self._thread)
 
+        if use_api:
+            # Ensure server is up.
+            self._ensure_api_server_started()
+            if self._api_server is None or not self._api_server.is_running():
+                self._set_busy(False)
+                self.lbl_status.setText("Idle")
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "API server not running",
+                    "Keep in VRAM is enabled, but the API server could not be started.\n"
+                    "Check the log for details, or disable 'Keep in VRAM (needs restart)'.",
+                )
+                return
+
+            # Wait until the server is actually accepting connections (prevents ConnectionRefused).
+            if not self._api_server.wait_until_ready(timeout_sec=20.0):
+                self._set_busy(False)
+                self.lbl_status.setText("Idle")
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "API server not ready",
+                    "The API server process started, but it did not become reachable on the configured port.\n"
+                    "Check the log output above for errors (missing deps, wrong CUDA, port blocked),\n"
+                    "or disable 'Keep in VRAM (needs restart)'.",
+                )
+                return
+
+            # Build API payload from UI.
+            caption = self.ed_caption.toPlainText().strip()
+            lyrics = self.ed_lyrics.toPlainText().strip()
+            if self.chk_instrumental.isChecked():
+                lyrics = "[Instrumental]"
+            payload = {
+                "prompt": caption,
+                "lyrics": lyrics,
+                "thinking": bool(self.chk_thinking_mode.isChecked()) if hasattr(self, 'chk_thinking_mode') else False,
+                "use_format": False,
+                "model": str(self.cmb_main_model.currentData() or "").strip() or None,
+                "bpm": int(self.spin_bpm.value()) if hasattr(self, 'spin_bpm') else 0,
+                "key_scale": str(self.cmb_keyscale.currentData() or ""),
+                "time_signature": str(self.cmb_timesig.currentData() or ""),
+                "audio_duration": float(self.spin_duration.value()),
+                "vocal_language": str(getattr(self.settings, 'vocal_language', '') or 'en') or 'en',
+                "inference_steps": int(self.spin_steps.value()) if hasattr(self, 'spin_steps') else 0,
+                "guidance_scale": float(self.spin_guidance.value()) if hasattr(self, 'spin_guidance') else 0.0,
+                "use_random_seed": bool(getattr(self.settings, 'seed_random', False)),
+                "seed": int(self.spin_seed.value()) if hasattr(self, 'spin_seed') else 0,
+                "batch_size": int(self.spin_batch.value()),
+                "task_type": str(self.cmb_task.currentText().strip() or 'text2music'),
+                "infer_method": str(self.cmb_infer_method.currentData() or 'ode') if hasattr(self, 'cmb_infer_method') else 'ode',
+                "shift": float(self.spin_shift.value()) if hasattr(self, 'spin_shift') else 3.0,
+                "audio_format": str(self.cmb_format.currentText().strip() or 'mp3'),
+                "lm_model_path": str(self.cmb_lm_model.currentData() or "").strip() or None,
+                "lm_backend": str(self.cmb_backend.currentText().strip() or 'vllm'),
+                "lm_temperature": float(getattr(self.settings, 'lm_temperature', 0.85) or 0.85),
+                "lm_top_p": float(getattr(self.settings, 'lm_top_p', 0.95) or 0.95),
+                "lm_top_k": int(getattr(self.settings, 'lm_top_k', 0) or 0),
+                "lm_negative_prompt": str(getattr(self.settings, 'lm_negative_prompt', '') or 'NO USER INPUT') or 'NO USER INPUT',
+            }
+            # Normalize a few "auto" values.
+            if payload.get("bpm") == 0:
+                payload["bpm"] = None
+            if not (payload.get("key_scale") or "").strip():
+                payload["key_scale"] = ""
+            if payload.get("time_signature") in {"0", "", None}:
+                payload["time_signature"] = ""
+            if payload.get("inference_steps") == 0:
+                payload["inference_steps"] = 8
+            if payload.get("guidance_scale") == 0.0:
+                payload["guidance_scale"] = 7.0
+            im = _ace15_normalize_infer_method(str(payload.get("infer_method") or ""))
+            payload["infer_method"] = im or "ode"
+
+            self._runner = ApiRunner(base_url=self._api_server.base_url, payload=payload, output_dir=out_dir)
+        else:
+            clipy = Path(self.ed_clipypy.text().strip())
+            args = [str(envpy), str(clipy), "-c", str(cfg_path)]
+            self._runner = Runner(args=args, cwd=proj, hide_console=False)  # forced OFF (UI removed)
+
+        self._runner.moveToThread(self._thread)
         self._thread.started.connect(self._runner.run)
         self._runner.log.connect(self._log)
         self._runner.finished.connect(self._done)
-
         self._thread.start()
 
     def _stop(self):
@@ -3863,7 +4478,13 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     w = MainWindow()
-    w.show()
+    # Start maximized for a more "app-like" experience.
+    # (FrameVision embedding uses AceStep15Pane and is unaffected.)
+    try:
+        w.showMaximized()
+    except Exception:
+        # Fallback if showMaximized isn't supported on a given platform/window manager
+        w.show()
     sys.exit(app.exec())
 
 
