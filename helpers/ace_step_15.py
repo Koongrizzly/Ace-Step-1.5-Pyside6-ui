@@ -38,6 +38,7 @@ except Exception:
 import os
 import sys
 import time
+from datetime import datetime
 import io
 import json
 import re
@@ -54,6 +55,15 @@ try:
     from PySide6 import QtMultimedia
 except Exception:  # QtMultimedia may be missing on some minimal installs
     QtMultimedia = None  # type: ignore
+
+# Optional system HUD colorizer (helpers/hud_colorizer.py)
+try:
+    from . import hud_colorizer  # type: ignore
+except Exception:
+    try:
+        import hud_colorizer  # type: ignore
+    except Exception:
+        hud_colorizer = None  # type: ignore
 
 
 _fv_no_wheel_patched = False
@@ -834,6 +844,8 @@ class Settings:
 
 
     banner_enabled: bool = True
+    # UI overlay: top-right always-visible system HUD
+    system_hud_enabled: bool = False
     ui_theme: str = "Signal Grey"
 
     backend: str = "vllm"
@@ -1557,6 +1569,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings_path = settings_path_for_root(self.fv_root_guess)
         self.settings = self._load_settings()
 
+        # Guard: during startup we apply settings to widgets; avoid auto-saving partial defaults.
+        self._loading_settings = True
+
         # Wheel guard (FrameVision style): prevent accidental edits while scrolling.
         try:
             if bool(getattr(self.settings, "wheel_guard_enabled", True)):
@@ -1598,6 +1613,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_cfg_path: Optional[Path] = None
         self._last_proj_root: Optional[Path] = None
 
+        # Optional always-visible system HUD (top-right)
+        self._system_hud_label: Optional[QtWidgets.QLabel] = None
+        self._system_hud_timer: Optional[QtCore.QTimer] = None
+        self._system_hud_last_net: Optional[tuple[int, int]] = None  # (bytes_recv, bytes_sent)
+        self._system_hud_last_t: float = 0.0
+
+        self._system_hud_max_w: int = 0  # prevent HUD width shrinking (avoids jitter)
         self._current_theme = (getattr(self.settings, "ui_theme", "Signal Grey") or "Signal Grey").strip() or "Signal Grey"
         self._build_ui()
         # Apply a simple default theme (no auto day/evening/night)
@@ -1616,6 +1638,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_outputs()
         self._queue_refresh_ui()
 
+        # Apply System HUD toggle after UI exists.
+        try:
+            if bool(getattr(self.settings, "system_hud_enabled", False)):
+                self._toggle_system_hud(True)
+        except Exception:
+            pass
+
         # Queue pump: if we have queued jobs and we're idle, start them.
         try:
             self._queue_pump_timer = QtCore.QTimer(self)
@@ -1631,6 +1660,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._ensure_api_server_started()
         except Exception:
             pass
+        # Startup finished; from now on widget changes may persist settings.
+        self._loading_settings = False
+
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # Persist UI settings on exit.
@@ -1649,7 +1681,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._api_server.stop()
         except Exception:
             pass
+        # Stop System HUD timer (do not change the saved setting on exit)
+        try:
+            self._stop_system_hud_runtime()
+        except Exception:
+            pass
         super().closeEvent(event)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        try:
+            self._position_system_hud()
+        except Exception:
+            pass
+        super().resizeEvent(event)
 
     def _ensure_api_server_started(self) -> None:
         """Start the FastAPI server (Keep in VRAM) if needed.
@@ -2703,6 +2747,14 @@ class MainWindow(QtWidgets.QMainWindow):
         hm.addAction(self.act_wheel_guard)
 
         hm.addSeparator()
+        self.act_system_hud = QtGui.QAction("System Hud", self)
+        self.act_system_hud.setCheckable(True)
+        self.act_system_hud.setChecked(bool(getattr(self.settings, "system_hud_enabled", False)))
+        self.act_system_hud.setToolTip("Show/hide a top-right always-visible system HUD.")
+        self.act_system_hud.toggled.connect(self._toggle_system_hud)
+        hm.addAction(self.act_system_hud)
+
+        hm.addSeparator()
         self.act_update = QtGui.QAction("Update", self)
         self.act_update.setToolTip("Check GitHub for updates and apply newer files.")
         self.act_update.triggered.connect(self._on_update_clicked)
@@ -2767,12 +2819,17 @@ class MainWindow(QtWidgets.QMainWindow):
         load_path = self.settings_path
         legacy_path = Path(__file__).resolve().with_name(SETTINGS_JSON)
         pointer_path = read_last_settings_path(self.fv_root_guess)
-        # Prefer the last-known settings file (if it exists), then the detected FV-root path,
-        # then the legacy file next to the script.
-        if pointer_path is not None:
-            load_path = pointer_path
-        elif not load_path.exists() and legacy_path.exists():
-            load_path = legacy_path
+        # If there is no settings JSON at the expected location, treat this as a "first run"
+        # and keep pure hardcoded defaults (do not fall back to last-used pointer or legacy files).
+        if load_path.exists():
+            # Prefer the last-known settings file (if it exists), then the detected FV-root path,
+            # then the legacy file next to the script.
+            if pointer_path is not None and pointer_path.exists():
+                load_path = pointer_path
+        elif legacy_path.exists():
+            # If the user explicitly kept using the legacy location, allow it only when the
+            # primary settings file exists. Otherwise we stay on defaults.
+            pass
         if load_path.exists():
             try:
                 s = Settings.from_dict(json.loads(load_path.read_text(encoding="utf-8")))
@@ -3203,6 +3260,10 @@ class MainWindow(QtWidgets.QMainWindow):
             cmb.setCurrentIndex(idx)
 
     def _save_settings(self):
+        # Skip saves while the UI is still initializing; otherwise defaults (e.g. duration=5)
+        # can overwrite persisted values during startup signal emissions.
+        if bool(getattr(self, "_loading_settings", False)):
+            return
         self._pull_ui_to_settings()
         try:
             fv = Path((self.settings.framevision_root or "").strip()) if (self.settings.framevision_root or "").strip() else getattr(self, "fv_root_guess", guess_framevision_root())
@@ -5244,6 +5305,302 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             self._save_settings()
+        except Exception:
+            pass
+
+
+    # -----------------------------
+    # System HUD (top-right overlay)
+    # -----------------------------
+    def _toggle_system_hud(self, enabled: bool):
+        """Show/hide an always-visible system HUD overlay."""
+        try:
+            self.settings.system_hud_enabled = bool(enabled)
+        except Exception:
+            pass
+
+        if enabled:
+            try:
+                self._ensure_system_hud_created()
+                if self._system_hud_label is not None:
+                    self._system_hud_label.setVisible(True)
+                self._start_system_hud_timer()
+                self._position_system_hud()
+            except Exception:
+                pass
+        else:
+            try:
+                self._stop_system_hud_runtime()
+                if self._system_hud_label is not None:
+                    self._system_hud_label.setVisible(False)
+            except Exception:
+                pass
+
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _stop_system_hud_runtime(self) -> None:
+        try:
+            if self._system_hud_timer is not None:
+                self._system_hud_timer.stop()
+                self._system_hud_timer.deleteLater()
+        except Exception:
+            pass
+        self._system_hud_timer = None
+
+    def _ensure_system_hud_created(self) -> None:
+        if self._system_hud_label is not None:
+            return
+
+        lbl = QtWidgets.QLabel(self)
+        lbl.setObjectName("systemHud")
+        lbl.setTextFormat(QtCore.Qt.RichText)
+        lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignTop)
+        lbl.setStyleSheet(
+            "QLabel#systemHud{"
+            "background: rgba(0,0,0,140);"
+            "color: #e8e8e8;"
+            "padding: 6px 8px;"
+            "border-radius: 10px;"
+            "font-size: 12px;"
+            "}"
+        )
+        lbl.setVisible(False)
+        lbl.raise_()
+        self._system_hud_label = lbl
+
+        # Best-effort: auto-install the colorizer on this label.
+        try:
+            if hud_colorizer is not None and hasattr(hud_colorizer, "auto_install_hud_colorizer"):
+                hud_colorizer.auto_install_hud_colorizer(interval_ms=1200)
+        except Exception:
+            pass
+
+        # Prime net counters.
+        self._system_hud_last_net = None
+        self._system_hud_last_t = 0.0
+        try:
+            self._system_hud_update()
+        except Exception:
+            pass
+
+    def _position_system_hud(self) -> None:
+        lbl = self._system_hud_label
+        if lbl is None or not lbl.isVisible():
+            return
+
+        # Small tuning values for nicer placement.
+        left_margin = 12
+        right_margin = 24  # keep a little extra room from the window edge
+        top_margin = 10
+
+        # Align vertically with the tab bar row (so it doesn't cover the fancy banner),
+        # but nudge slightly upward to sit cleanly above the divider line.
+        y = top_margin
+        try:
+            if hasattr(self, "tabs") and self.tabs is not None:
+                tab_pos = self.tabs.mapTo(self, QtCore.QPoint(0, 0))
+                y = max(top_margin, int(tab_pos.y()) + 2)  # was +4
+        except Exception:
+            pass
+
+        # Measure natural width, but prevent it from shrinking (this avoids left/right jitter).
+        try:
+            lbl.adjustSize()
+        except Exception:
+            pass
+
+        try:
+            natural_w = int(lbl.sizeHint().width())
+        except Exception:
+            natural_w = int(lbl.width())
+
+        # Cap width to available space, but keep the maximum we've seen so far.
+        avail_w = max(120, int(self.width()) - left_margin - right_margin)
+        try:
+            self._system_hud_max_w = int(min(max(getattr(self, "_system_hud_max_w", 0), natural_w), avail_w))
+        except Exception:
+            self._system_hud_max_w = int(min(max(natural_w, 0), avail_w))
+
+        try:
+            lbl.setFixedWidth(self._system_hud_max_w)
+        except Exception:
+            pass
+
+        # Anchor to the right edge (fixed right margin).
+        try:
+            x = int(self.width()) - right_margin - int(lbl.width())
+            if x < left_margin:
+                x = left_margin
+            lbl.move(x, y)
+            lbl.raise_()
+        except Exception:
+            pass
+
+    def _start_system_hud_timer(self) -> None:
+        if self._system_hud_timer is not None:
+            try:
+                if not self._system_hud_timer.isActive():
+                    self._system_hud_timer.start()
+            except Exception:
+                pass
+            return
+
+        t = QtCore.QTimer(self)
+        t.setInterval(1000)
+        t.timeout.connect(self._system_hud_update)
+        self._system_hud_timer = t
+        t.start()
+
+    def _system_hud_update(self) -> None:
+        lbl = self._system_hud_label
+        if lbl is None or not lbl.isVisible():
+            return
+
+        # psutil is optional. If missing, we show what we can.
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            psutil = None  # type: ignore
+
+        cpu_pct = None
+        cpu_temp = None
+        mem_used_gb = None
+        mem_total_gb = None
+        mem_pct = None
+        if psutil is not None:
+            try:
+                cpu_pct = float(psutil.cpu_percent(interval=None))
+            except Exception:
+                cpu_pct = None
+            try:
+                vm = psutil.virtual_memory()
+                mem_pct = float(vm.percent)
+                mem_used_gb = float(vm.used) / (1024.0 ** 3)
+                mem_total_gb = float(vm.total) / (1024.0 ** 3)
+            except Exception:
+                mem_pct = None
+
+            # CPU temperature (best-effort; may be unavailable on Windows)
+            try:
+                temps = psutil.sensors_temperatures(fahrenheit=False)  # type: ignore[attr-defined]
+                vals = []
+                for _, entries in (temps or {}).items():
+                    for e in entries or []:
+                        v = getattr(e, "current", None)
+                        if v is not None:
+                            try:
+                                vals.append(float(v))
+                            except Exception:
+                                pass
+                if vals:
+                    cpu_temp = int(round(max(vals)))
+            except Exception:
+                cpu_temp = None
+
+        # Net speed (DL/UL)
+        dl_txt = ul_txt = None
+        if psutil is not None:
+            try:
+                now = time.time()
+                io_net = psutil.net_io_counters()
+                cur = (int(io_net.bytes_recv), int(io_net.bytes_sent))
+                if self._system_hud_last_net is not None and self._system_hud_last_t > 0:
+                    dt = max(0.25, now - self._system_hud_last_t)
+                    drecv = max(0, cur[0] - self._system_hud_last_net[0])
+                    dsend = max(0, cur[1] - self._system_hud_last_net[1])
+                    dl_bps = drecv / dt
+                    ul_bps = dsend / dt
+                    def _fmt_speed(bps: float) -> str:
+                        kb = bps / 1024.0
+                        if kb >= 1024.0:
+                            return f"{kb/1024.0:.1f} MB/s"
+                        return f"{kb:.0f} KB/s"
+                    dl_txt = _fmt_speed(dl_bps)
+                    ul_txt = _fmt_speed(ul_bps)
+                self._system_hud_last_net = cur
+                self._system_hud_last_t = now
+            except Exception:
+                pass
+
+        # GPU via nvidia-smi (best-effort)
+        gpu_util = gpu_temp = None
+        vram_used = vram_total = None
+        try:
+            cmd = ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=1.5, text=True).strip()
+            if out:
+                parts = [p.strip() for p in out.split(",")]
+                if len(parts) >= 4:
+                    gpu_util = int(float(parts[0]))
+                    gpu_temp = int(float(parts[1]))
+                    vram_used = float(parts[2])
+                    vram_total = float(parts[3])
+        except Exception:
+            pass
+
+        # Compose HUD text. Keep tokens compatible with hud_colorizer.py patterns.
+        segs: list[str] = []
+
+        # Date + time (local)
+        try:
+            segs.append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        except Exception:
+            pass
+
+        # GPU / DDR / CPU are always included (placeholders if unavailable)
+        if gpu_util is not None:
+            seg = f"GPU : {gpu_util}%"
+            if gpu_temp is not None:
+                seg += f" {gpu_temp}°C"
+        else:
+            seg = "GPU : --%"
+
+        # Include VRAM under GPU (separate token so the colorizer can treat it as VRAM)
+        if vram_used is not None and vram_total is not None and vram_total > 0:
+            try:
+                used_gb = vram_used / 1024.0
+                total_gb = vram_total / 1024.0
+                pct = int(round((vram_used / vram_total) * 100.0))
+                seg += f"  VRAM : {used_gb:.1f}/{total_gb:.1f} GB {pct}%"
+            except Exception:
+                seg += "  VRAM : --/-- GB --%"
+        else:
+            seg += "  VRAM : --/-- GB --%"
+        segs.append(seg)
+
+        # DDR = system RAM (used/total and percent)
+        if mem_used_gb is not None and mem_total_gb is not None and mem_total_gb > 0 and mem_pct is not None:
+            try:
+                segs.append(f"DDR : {mem_used_gb:.1f}/{mem_total_gb:.1f} GB {int(round(mem_pct))}%")
+            except Exception:
+                segs.append("DDR : --/-- GB --%")
+        else:
+            segs.append("DDR : --/-- GB --%")
+
+        if cpu_pct is not None:
+            seg = f"CPU {int(round(cpu_pct))}%"
+            if cpu_temp is not None:
+                seg += f" {cpu_temp}°C"
+            segs.append(seg)
+        else:
+            segs.append("CPU --%")
+        if dl_txt is not None:
+            segs.append(f"DL {dl_txt}")
+        if ul_txt is not None:
+            segs.append(f"UL {ul_txt}")
+
+        txt = "  |  ".join(segs)
+        try:
+            lbl.setText(txt)
+        except Exception:
+            pass
+        try:
+            lbl.adjustSize()
+            self._position_system_hud()
         except Exception:
             pass
     def _on_update_clicked(self):
