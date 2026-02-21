@@ -864,7 +864,7 @@ class Settings:
     use_flash_attention: bool = False
     # If enabled, the UI will use the FastAPI server workflow (keeps models in VRAM).
     # Requires restart to take effect.
-    keep_in_vram: bool = False
+    keep_in_vram: bool = True
     main_model_path: str = ""
     lm_model_path: str = ""
     lm_enhance: bool = False
@@ -1633,6 +1633,11 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # Save settings on exit so UI toggles/paths persist across restarts.
+        try:
+            self._save_settings()
+        except Exception:
+            pass
         # Persist queue so pending jobs can resume after restart.
         try:
             self._queue_save()
@@ -2613,7 +2618,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "and generation will run via the API instead of spawning cli.py each time.\n"
             "This keeps the model in VRAM between runs."
         )
-        self.chk_keep_in_vram.toggled.connect(lambda _on: self._log("Keep in VRAM changed — restart required to take effect."))
+        self.chk_keep_in_vram.toggled.connect(self._on_keep_in_vram_toggled)
 
         perf.addWidget(self.chk_offload_dit, 0, 0)
         perf.addWidget(self.chk_offload, 0, 1)
@@ -5038,7 +5043,23 @@ class MainWindow(QtWidgets.QMainWindow):
             it.setData(QtCore.Qt.UserRole, str(p))
             self.lst_outputs.addItem(it)
 
-    def _open_output_folder(self):
+    
+    def _on_keep_in_vram_toggled(self, _on: bool) -> None:
+        # Persist immediately so the toggle state is remembered on next launch.
+        try:
+            self.settings.keep_in_vram = bool(self.chk_keep_in_vram.isChecked())
+        except Exception:
+            pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        try:
+            self._log("Keep in VRAM changed — restart required to take effect.")
+        except Exception:
+            pass
+
+def _open_output_folder(self):
         out_dir = Path(self.ed_outdir.text().strip())
         if out_dir.exists():
             open_in_explorer(out_dir)
@@ -5306,7 +5327,7 @@ class MainWindow(QtWidgets.QMainWindow):
         title.setWordWrap(True)
         v.addWidget(title)
 
-        info = QtWidgets.QLabel("The app needs restart after applying updates, Do NOT select presetmanager.json if you don't want your genre presets to be reset to default")
+        info = QtWidgets.QLabel("The app needs restart after applying updates.")
         info.setWordWrap(True)
         v.addWidget(info)
 
