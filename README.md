@@ -4,10 +4,10 @@
 
 | 🔎 Quick links | |
 |---|---|
-| 🧩 Install notes | [Jump](#-install-notes) |
+| 🧩 Install notes | [Jump](#-install-notes-) |
 | ✨ Features | [Jump](#-features-) |
 | 🚫 Not working | [Jump](#-not-workingnot-installed) |
-| 🛠️ Todo | [Jump](#-todo-) |
+| 🛠️ Todo | [Jump](#-Todo) |
 
 All credits to & original model here : https://github.com/ace-step/ACE-Step-1.5
 ---
