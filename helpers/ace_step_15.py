@@ -159,6 +159,9 @@ APP_TITLE = "Ace-Step 1.5 — Music Creator"
 SETTINGS_JSON = "ace_step_15_ui.settings.json"
 SETTINGS_PATH_POINTER_JSON = "ace_step_15_ui.settings_path.json"  # remembers last settings file location
 
+# Persist queued jobs so they can resume after app restart.
+ACE15_QUEUE_JSON = "ace_step_15_ui.queue.json"
+
 
 # Preset Manager
 ACE15_PRESET_MANAGER_JSON = "presetmanager.json"
@@ -222,6 +225,11 @@ def guess_framevision_root() -> Path:
 
 def settings_path_for_root(framevision_root: Path) -> Path:
     return framevision_root / "presets" / "setsave" / SETTINGS_JSON
+
+
+def queue_path_for_root(framevision_root: Path) -> Path:
+    """Queue persistence file stored under presets/setsave."""
+    return framevision_root / "presets" / "setsave" / ACE15_QUEUE_JSON
 
 
 def preset_manager_path_for_root(framevision_root: Path) -> Path:
@@ -923,13 +931,65 @@ class QueueJob:
     task_type: str = ""
     duration_s: float = 0.0
 
+    def to_dict(self) -> dict:
+        """Serialize this job to JSON-safe primitives."""
+        return {
+            "job_id": int(self.job_id),
+            "created_epoch": float(self.created_epoch),
+            "use_api": bool(self.use_api),
+            "out_dir": str(self.out_dir) if self.out_dir else "",
+
+            "cli_args": list(self.cli_args) if self.cli_args else None,
+            "cli_cwd": str(self.cli_cwd) if self.cli_cwd else None,
+            "cfg_path": str(self.cfg_path) if self.cfg_path else None,
+
+            "api_payload": self.api_payload if self.api_payload else None,
+            "api_base_url": self.api_base_url,
+
+            "title": self.title,
+            "batch_size": int(self.batch_size or 1),
+            "seed": self.seed,
+            "subgenre_for_naming": self.subgenre_for_naming,
+            "task_type": self.task_type,
+            "duration_s": float(self.duration_s or 0.0),
+        }
+
     @staticmethod
-    def from_dict(d: dict) -> "Settings":
-        s = Settings()
-        for k, v in d.items():
-            if hasattr(s, k):
-                setattr(s, k, v)
-        return s
+    def from_dict(d: dict) -> "QueueJob":
+        """Deserialize a QueueJob from a dict (created by to_dict)."""
+
+        def _p(v) -> Optional[Path]:
+            if v is None:
+                return None
+            if isinstance(v, Path):
+                return v
+            if isinstance(v, str):
+                s = v.strip()
+                return Path(s) if s else None
+            return None
+
+        out_dir = _p(d.get("out_dir")) or Path(".")
+
+        return QueueJob(
+            job_id=int(d.get("job_id", 0) or 0),
+            created_epoch=float(d.get("created_epoch", time.time()) or time.time()),
+            use_api=bool(d.get("use_api", False)),
+            out_dir=out_dir,
+
+            cli_args=(list(d.get("cli_args") or []) or None),
+            cli_cwd=_p(d.get("cli_cwd")),
+            cfg_path=_p(d.get("cfg_path")),
+
+            api_payload=(d.get("api_payload") if isinstance(d.get("api_payload"), dict) else None),
+            api_base_url=(str(d.get("api_base_url")) if d.get("api_base_url") else None),
+
+            title=str(d.get("title", "") or ""),
+            batch_size=int(d.get("batch_size", 1) or 1),
+            seed=str(d.get("seed", "") or ""),
+            subgenre_for_naming=str(d.get("subgenre_for_naming", "") or ""),
+            task_type=str(d.get("task_type", "") or ""),
+            duration_s=float(d.get("duration_s", 0.0) or 0.0),
+        )
 
 
 class Runner(QtCore.QObject):
@@ -1489,6 +1549,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_job: Optional[QueueJob] = None
         self._queue_pump_timer: Optional[QtCore.QTimer] = None
 
+        # Load persisted queue (best-effort). If the app was closed while a job
+        # was running, we treat it as pending again on next start.
+        self._queue_load()
+
         # Optional API server workflow ("Keep in VRAM")
         self._api_server: Optional[ApiServerManager] = None
 
@@ -1543,6 +1607,11 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # Persist queue so pending jobs can resume after restart.
+        try:
+            self._queue_save()
+        except Exception:
+            pass
         # Best-effort: stop API server on exit.
         try:
             if self._api_server is not None:
@@ -1894,10 +1963,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         row_ly = QtWidgets.QHBoxLayout()
         row_ly.addWidget(QtWidgets.QLabel("Lyrics (optional)"))
+        self.btn_clear_lyrics = QtWidgets.QPushButton("Clear")
+        self.btn_clear_lyrics.setToolTip("Clear the lyrics box.")
+        self.btn_clear_lyrics.clicked.connect(self._clear_lyrics_clicked)
         self.btn_gen_lyrics = QtWidgets.QPushButton("random lyric")
         self.btn_gen_lyrics.setToolTip("Generate quick placeholder lyrics for testing (does not change caption/BPM/duration).")
         self.btn_gen_lyrics.clicked.connect(self._generate_lyrics_clicked)
         row_ly.addStretch(1)
+        row_ly.addWidget(self.btn_clear_lyrics)
         row_ly.addWidget(self.btn_gen_lyrics)
         v.addLayout(row_ly)
 
@@ -3653,19 +3726,134 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
     def _generate_lyrics_clicked(self):
-        # Quick placeholder lyrics for testing (no LM call).
+        """Generate quick placeholder lyrics for testing (no LM call).
+
+        Goal: a more "real song"-shaped placeholder (verse / pre / hook / bridge),
+        still instant, and lightly influenced by the current caption/BPM.
+        """
         if self.chk_instrumental.isChecked():
             self.chk_instrumental.setChecked(False)
+
         import time
+
         rnd = random.Random(time.time_ns() & 0xFFFFFFFF)
-        words = [w.strip(".,!?;:()[]{}\"'").lower() for w in self.ed_caption.toPlainText().split()]
-        words = [w for w in words if len(w) >= 4 and w.isascii()]
-        kw = rnd.choice(words) if words else "tonight"
-        txt = ("[Verse 1]\n" + f"{kw} in the lights, we come alive\n" +
-               "Bass in the chest, let it decide\n\n" +
-               "[Chorus]\n" + f"{kw}, {kw}, one more time\n" +
-               "Hands up, hands up, feel the drive\n")
-        self.ed_lyrics.setPlainText(txt)
+
+        # Pull a couple of safe keywords from the caption, if present.
+        raw_words = [w.strip(".,!?;:()[]{}\"'").lower() for w in self.ed_caption.toPlainText().split()]
+        words = [w for w in raw_words if len(w) >= 4 and w.isascii()]
+        # Prefer more lyrical words over generic production terms.
+        blacklist = {
+            "bpm", "kick", "snare", "hats", "hi-hats", "hihat", "bass", "sub",
+            "mix", "stereo", "reverb", "delay", "master", "eq", "compressor",
+            "house", "techno", "trance", "dubstep", "drums", "synth", "pads",
+            "vocal", "vocals", "female", "male", "chops", "loop", "loops",
+        }
+        words = [w for w in words if w not in blacklist]
+
+        kw1 = rnd.choice(words) if words else "tonight"
+        kw2 = kw1
+        if len(words) >= 2:
+            for _ in range(6):
+                cand = rnd.choice(words)
+                if cand != kw1:
+                    kw2 = cand
+                    break
+        else:
+            kw2 = rnd.choice(["neon", "heartbeat", "river", "echo", "firelight", "midnight"]) if kw1 == "tonight" else "tonight"
+
+        bpm = 0
+        try:
+            bpm = int(round(float(self.spin_bpm.value())))
+        except Exception:
+            bpm = 0
+        ts = ""
+        try:
+            ts_v = int(self.cmb_timesig.currentData() or 0)
+            ts = f"{ts_v}/4" if ts_v else ""
+        except Exception:
+            ts = ""
+
+        # Tiny mood heuristic from caption (kept intentionally simple).
+        caption_l = (self.ed_caption.toPlainText() or "").lower()
+        if any(x in caption_l for x in ["dark", "midnight", "late-night", "underground", "smoke", "shadow"]):
+            palette = ["streetlights", "low tide", "cold air", "afterhours", "slow burn"]
+        elif any(x in caption_l for x in ["uplift", "euphor", "bright", "sun", "summer", "anthem"]):
+            palette = ["sunrise", "open sky", "golden hours", "wide open", "runaway"]
+        else:
+            palette = ["neon", "sparks", "city rain", "pulse", "gravity"]
+
+        scene = rnd.choice(palette)
+        adlibs = ["(oh)", "(yeah)", "(hold up)", "(come on)", "(let it go)", "(mm-hm)"]
+        ad1, ad2 = rnd.choice(adlibs), rnd.choice(adlibs)
+
+        # Keep the hook short + repeatable for music generation.
+        hook_lines = rnd.choice([
+            [f"{kw1} {kw1}, keep it close", f"{kw2} {kw2}, let it go"],
+            [f"{kw1} on my tongue {ad1}", f"{kw2} in my lungs {ad2}"],
+            [f"Say {kw1}, say it twice", f"Say {kw2}, roll the dice"],
+        ])
+
+        tempo_tag = ""
+        if bpm >= 60:
+            tempo_tag = f"[{bpm} BPM" + (f", {ts}" if ts else "") + "]"
+        elif ts:
+            tempo_tag = f"[{ts}]"
+
+        txt = (
+            f"{tempo_tag}\n".lstrip() +
+            "[Verse 1]\n"
+            f"{kw1} in the {scene}, I feel it start\n"
+            f"Hands on the wheel, {kw2} in my heart\n"
+            "Foot on the line, we lean into the sound\n"
+            "Count to four, let the floor shake the ground\n\n"
+            "[Pre-Chorus]\n"
+            f"If we fall, we fall upward {ad1}\n"
+            "Breathing in, breathing out, keep it moving\n"
+            f"No more ghosts, only {kw1} {ad2}\n"
+            "When it drops, you know what we're doing\n\n"
+            "[Chorus]\n"
+            f"{hook_lines[0]}\n"
+            f"{hook_lines[1]}\n"
+            "All night long, we don't lose the spark\n"
+            f"Meet me where the {kw1} leaves a mark\n\n"
+            "[Verse 2]\n"
+            f"{kw2} in the mirror, I like that look\n"
+            f"{kw1} in the rhythm, got me by the hook\n"
+            "We chase the skyline, faster than doubt\n"
+            "Turn it up, turn it up, drown it out\n\n"
+            "[Bridge]\n"
+            "Hold that note, let it hover in the air\n"
+            "One step back, then we go everywhere\n"
+            "If you need a sign, it's written in the bass\n"
+            "Close your eyes, feel the room change its face\n\n"
+            "[Final Chorus]\n"
+            f"{hook_lines[0]}\n"
+            f"{hook_lines[1]}\n"
+            "All night long, we don't lose the spark\n"
+            f"Meet me where the {kw1} leaves a mark\n\n"
+            "[Outro]\n"
+            f"{kw1}... {kw2}... fade it slow\n"
+        )
+
+        self.ed_lyrics.setPlainText(txt.strip() + "\n")
+
+
+    def _clear_lyrics_clicked(self):
+        """Clear the lyrics box."""
+        # If Instrumental is enabled, the UI may force a placeholder lyric.
+        # Turn it off so the box can actually be empty.
+        try:
+            if self.chk_instrumental.isChecked():
+                self.chk_instrumental.setChecked(False)
+        except Exception:
+            pass
+        try:
+            self.ed_lyrics.clear()
+        except Exception:
+            try:
+                self.ed_lyrics.setPlainText("")
+            except Exception:
+                pass
 
 
     def _refresh_main_models(self):
@@ -4004,6 +4192,74 @@ class MainWindow(QtWidgets.QMainWindow):
     # -----------------------------
     # Queue
     # -----------------------------
+    def _queue_save(self) -> None:
+        """Persist current queue (and any active job) under presets/setsave."""
+        try:
+            root = self.fv_root_guess
+            p = queue_path_for_root(root)
+            ensure_dir(p.parent)
+
+            jobs: list[QueueJob] = []
+            if self._active_job is not None:
+                # If the app closes mid-run, treat it as pending again on next start.
+                jobs.append(self._active_job)
+            jobs.extend(list(self._queue or []))
+
+            payload = {
+                "version": 1,
+                "saved_epoch": time.time(),
+                "next_job_id": int(getattr(self, "_next_job_id", 1) or 1),
+                "jobs": [j.to_dict() for j in jobs],
+            }
+
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(p)
+        except Exception:
+            pass
+
+    def _queue_load(self) -> None:
+        """Load persisted queue from presets/setsave (best-effort)."""
+        try:
+            root = self.fv_root_guess
+            p = queue_path_for_root(root)
+            if not p.exists():
+                return
+
+            data = json.loads(p.read_text(encoding="utf-8"))
+            raw = data.get("jobs", [])
+            jobs: list[QueueJob] = []
+            if isinstance(raw, list):
+                for jd in raw:
+                    if not isinstance(jd, dict):
+                        continue
+                    try:
+                        j = QueueJob.from_dict(jd)
+                        # Only keep jobs that still have enough info to run.
+                        if j.use_api:
+                            if isinstance(j.api_payload, dict):
+                                jobs.append(j)
+                        else:
+                            if j.cli_args and j.cli_cwd:
+                                jobs.append(j)
+                    except Exception:
+                        continue
+
+            # Loaded jobs are pending; active job is cleared.
+            self._active_job = None
+            self._queue = jobs
+
+            max_id = max([int(j.job_id) for j in jobs], default=0)
+            try:
+                nxt = int(data.get("next_job_id", 0) or 0)
+            except Exception:
+                nxt = 0
+            self._next_job_id = max(nxt, max_id + 1, 1)
+        except Exception:
+            # Corrupt file -> ignore
+            self._queue = []
+            self._next_job_id = 1
+
     def _is_running(self) -> bool:
         return self._active_job is not None or self._runner is not None or self._thread is not None
 
@@ -4222,10 +4478,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _queue_enqueue(self, job: QueueJob) -> None:
         self._queue.append(job)
+        self._queue_save()
         self._queue_refresh_ui(force=True)
 
     def _queue_clear(self) -> None:
         self._queue.clear()
+        self._queue_save()
         self._queue_refresh_ui(force=True)
 
     def _queue_remove_selected(self) -> None:
@@ -4249,6 +4507,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if 0 <= qi < len(self._queue):
             j = self._queue.pop(qi)
             self._log(f"Removed job #{j.job_id} from queue")
+            self._queue_save()
         self._queue_refresh_ui(force=True)
 
 
@@ -4263,6 +4522,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if 0 <= qi < len(self._queue):
             j = self._queue.pop(qi)
             self._log(f"Removed job #{j.job_id} from queue")
+            self._queue_save()
         self._queue_refresh_ui(force=True)
 
     def _queue_context_menu(self, pos: QtCore.QPoint) -> None:
@@ -4306,6 +4566,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ok = self._start_job(job)
         if ok:
             self._queue.pop(0)
+            self._queue_save()
         self._queue_refresh_ui(force=True)
 
     def _on_generate_clicked(self) -> None:
@@ -4341,6 +4602,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
 
         self._active_job = job
+
+        # Save immediately so if the app closes mid-run we can resume this job.
+        try:
+            self._queue_save()
+        except Exception:
+            pass
 
         # Snapshot outputs just before the run so we can identify what's new.
         try:
@@ -4470,6 +4737,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Clear active job and start next queued one (if any).
         self._active_job = None
+        try:
+            self._queue_save()
+        except Exception:
+            pass
         self._queue_refresh_ui()
         # Pump immediately so it feels instant.
         self._queue_pump(force=True)
