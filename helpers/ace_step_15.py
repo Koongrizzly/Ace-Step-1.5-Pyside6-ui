@@ -2192,13 +2192,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # While generating, don't touch other controls/banners.
         if busy:
-            return
-
-        if refresh_details:
-            try:
-                self._queue_update_details_from_selection()
-            except Exception:
-                pass
             try:
                 self._update_api_change_locks()
             except Exception:
@@ -2491,7 +2484,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_last_ui_refresh = 0.0
         self._queue_ui_timer = QtCore.QTimer(self)
         self._queue_ui_timer.setInterval(5000)
-        self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=True, refresh_details=False))
+        self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=True))
         self._queue_ui_timer.start()
         self._queue_ui_timer.start()
 
@@ -3009,6 +3002,36 @@ class MainWindow(QtWidgets.QMainWindow):
         footer = QtWidgets.QHBoxLayout(self._footer_bar)
         footer.setContentsMargins(12, 8, 12, 8)
         footer.setSpacing(10)
+
+        # Footer transport controls (Preview player)
+        self.btn_footer_prev = QtWidgets.QPushButton("Prev")
+        self.btn_footer_play = QtWidgets.QPushButton("Play")
+        self.btn_footer_stop = QtWidgets.QPushButton("Stop")
+        self.btn_footer_next = QtWidgets.QPushButton("Next")
+        for b in (self.btn_footer_prev, self.btn_footer_play, self.btn_footer_stop, self.btn_footer_next):
+            b.setObjectName("ace15_footer_transport")
+            b.setEnabled(False)
+            b.setMinimumHeight(42)
+
+        self.lbl_footer_track = QtWidgets.QLabel("")
+        self.lbl_footer_track.setObjectName("ace15_footer_track")
+        self.lbl_footer_track.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.lbl_footer_time = QtWidgets.QLabel("0:00 / 0:00")
+        self.lbl_footer_time.setObjectName("ace15_footer_time")
+
+        # Wire footer transport controls
+        self.btn_footer_prev.clicked.connect(self._footer_preview_prev)
+        self.btn_footer_next.clicked.connect(self._footer_preview_next)
+        self.btn_footer_play.clicked.connect(self._footer_preview_play_pause)
+        self.btn_footer_stop.clicked.connect(self._preview_stop)
+
+        footer.addWidget(self.btn_footer_prev)
+        footer.addWidget(self.btn_footer_play)
+        footer.addWidget(self.btn_footer_stop)
+        footer.addWidget(self.btn_footer_next)
+        footer.addSpacing(8)
+        footer.addWidget(self.lbl_footer_track, 1)
+        footer.addWidget(self.lbl_footer_time, 0)
 
         # Match the user's request: +3px font size for these buttons.
         for b in (self.btn_presets, self.btn_save, self.btn_run, self.btn_stop):
@@ -5356,16 +5379,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             return
 
-        try:
-            self.tbl_queue.blockSignals(True)
-        except Exception:
-            pass
-
+        # Avoid clobbering the details pane while we rebuild the table (selectionChanged may fire).
+        self._queue_in_refresh = True
         try:
             self.tbl_queue.setRowCount(0)
         except Exception:
             try:
-                self.tbl_queue.blockSignals(False)
+                self._queue_in_refresh = False
             except Exception:
                 pass
             return
@@ -5415,25 +5435,17 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # Only refresh the details pane when explicitly requested.
-        # Background refreshes (queue pump + 5s UI refresh) should not reset/overwrite
-        # the details text, otherwise it becomes impossible to read/scroll.
+        # Rebuild finished.
+        try:
+            self._queue_in_refresh = False
+        except Exception:
+            pass
+
         if refresh_details:
             try:
                 self._queue_update_details_from_selection()
             except Exception:
                 pass
-
-        # Do not let auto refresh fight scrolling in the details panel.
-
-        try:
-
-            self.tbl_queue.blockSignals(False)
-
-        except Exception:
-
-            pass
-
 
         # Keep model/LM/Keep-in-VRAM controls locked while queued jobs exist.
         try:
@@ -5587,6 +5599,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         job_id = self._queue_get_selected_job_id()
         if job_id is None:
+            # During a table rebuild, selection can temporarily clear; don't overwrite the details pane.
+            try:
+                if bool(getattr(self, "_queue_in_refresh", False)):
+                    return
+            except Exception:
+                pass
             try:
                 self.ed_queue_details.setPlainText("Select a job to see details.\n")
                 self.btn_queue_copy_details.setEnabled(False)
@@ -5691,7 +5709,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _queue_enqueue(self, job: QueueJob) -> None:
         self._queue.append(job)
         self._queue_save()
-        self._queue_refresh_ui(force=True)
+        self._queue_refresh_ui(force=True, refresh_details=False)
 
     def _queue_clear(self) -> None:
         self._queue.clear()
@@ -5779,7 +5797,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ok:
             self._queue.pop(0)
             self._queue_save()
-        self._queue_refresh_ui(force=True, refresh_details=False)
+        self._queue_refresh_ui(force=True)
 
     def _on_generate_clicked(self) -> None:
         job = self._build_job_from_ui()
@@ -6612,6 +6630,11 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
+            if hasattr(self, 'lbl_footer_track'):
+                self.lbl_footer_track.setText(path.name)
+        except Exception:
+            pass
+        try:
             self.btn_preview_open.setEnabled(True)
         except Exception:
             pass
@@ -6623,6 +6646,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.btn_preview_stop.setEnabled(False)
                 self.sld_preview.setEnabled(False)
                 self.lbl_preview_time.setText("0:00 / 0:00")
+                try:
+                    if hasattr(self, 'lbl_footer_time'):
+                        self.lbl_footer_time.setText("0:00 / 0:00")
+                except Exception:
+                    pass
             except Exception:
                 pass
             return
@@ -6637,6 +6665,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_preview_play.setEnabled(True)
             self.btn_preview_stop.setEnabled(True)
             self.sld_preview.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            for b in (getattr(self, 'btn_footer_prev', None), getattr(self, 'btn_footer_play', None), getattr(self, 'btn_footer_stop', None), getattr(self, 'btn_footer_next', None)):
+                if b is not None:
+                    b.setEnabled(True)
         except Exception:
             pass
 
@@ -6723,6 +6757,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             st = self._preview_player.playbackState()
             self.btn_preview_play.setText("Pause" if st == QtMultimedia.QMediaPlayer.PlayingState else "Play")
+            try:
+                if hasattr(self, 'btn_footer_play') and self.btn_footer_play is not None:
+                    self.btn_footer_play.setText("Pause" if st == QtMultimedia.QMediaPlayer.PlayingState else "Play")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -6747,9 +6786,76 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 pos = int(self._preview_player.position() or 0)
             self.lbl_preview_time.setText(f"{self._preview_fmt_ms(pos)} / {self._preview_fmt_ms(dur)}")
+            try:
+                if hasattr(self, 'lbl_footer_time') and self.lbl_footer_time is not None:
+                    self.lbl_footer_time.setText(f"{self._preview_fmt_ms(pos)} / {self._preview_fmt_ms(dur)}")
+            except Exception:
+                pass
         except Exception:
             pass
 
+
+    
+    # Footer transport helpers
+    def _footer_preview_ensure_loaded(self) -> bool:
+        """Ensure the Preview player has a loaded path; if not, try current selection."""
+        try:
+            if getattr(self, '_preview_path', None):
+                return True
+        except Exception:
+            pass
+        try:
+            item = self.lst_outputs.currentItem() if hasattr(self, 'lst_outputs') else None
+            if item is None and hasattr(self, 'lst_outputs') and self.lst_outputs.count() > 0:
+                item = self.lst_outputs.item(0)
+                self.lst_outputs.setCurrentItem(item)
+            if item is None:
+                return False
+            p = Path(item.data(QtCore.Qt.UserRole))
+            self._preview_load(p, autoplay=False)
+            return True
+        except Exception:
+            return False
+
+    def _footer_preview_prev(self) -> None:
+        try:
+            if not hasattr(self, 'lst_outputs') or self.lst_outputs.count() <= 0:
+                return
+            cur = self.lst_outputs.currentRow()
+            if cur < 0:
+                cur = 0
+            new = max(0, cur - 1)
+            self.lst_outputs.setCurrentRow(new)
+            item = self.lst_outputs.item(new)
+            if item is not None:
+                p = Path(item.data(QtCore.Qt.UserRole))
+                self._preview_load(p, autoplay=True)
+        except Exception:
+            pass
+
+    def _footer_preview_next(self) -> None:
+        try:
+            if not hasattr(self, 'lst_outputs') or self.lst_outputs.count() <= 0:
+                return
+            cur = self.lst_outputs.currentRow()
+            if cur < 0:
+                cur = 0
+            new = min(self.lst_outputs.count() - 1, cur + 1)
+            self.lst_outputs.setCurrentRow(new)
+            item = self.lst_outputs.item(new)
+            if item is not None:
+                p = Path(item.data(QtCore.Qt.UserRole))
+                self._preview_load(p, autoplay=True)
+        except Exception:
+            pass
+
+    def _footer_preview_play_pause(self) -> None:
+        try:
+            if not self._footer_preview_ensure_loaded():
+                return
+        except Exception:
+            return
+        self._preview_toggle_play()
 
     def _toggle_wheel_guard(self, enabled: bool):
         try:
