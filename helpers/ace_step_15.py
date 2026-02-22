@@ -782,6 +782,13 @@ def discover_lm_models(project_root: Path) -> list[str]:
             if p.is_dir() and "acestep-5Hz-lm" in p.name:
                 found.append(p.name)
     found = sorted(set(found), key=lambda s: (len(s), s))
+    # Add turbo-rl only if present locally
+    try:
+        if (ckpt / "acestep-v15-turbo-rl").exists():
+            if "acestep-v15-turbo-rl" not in found:
+                found.append("acestep-v15-turbo-rl")
+    except Exception:
+        pass
     # NOTE: 3B LM variant was an accidental option in this UI; hide it.
     found = [m for m in found if "acestep-5Hz-lm-3B" not in m]
     # If not found yet, still return known so user can pick and let ACE download
@@ -809,7 +816,8 @@ def discover_main_models(project_root: Path) -> list[str]:
         "acestep-v15-base",
         "acestep-v15-sft",
         "acestep-v15-turbo",
-        "acestep-v15-turbo-rl",
+        # NOTE: acestep-v15-turbo-rl is not publicly released (HF model zoo says "To be released").
+        # We only show it if it already exists locally in checkpoints.
     ]
 
     found: list[str] = []
@@ -1809,7 +1817,24 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _on_restart_server_clicked(self) -> None:
-        """Start/restart the API server to apply the selected model/LM."""
+        """Start/restart the API server to apply the selected model/LM.
+
+        Safeguards:
+        - Disabled while a track is generating (Stop button enabled).
+        - Always stop/unload the running server first (same behavior as turning off Keep in VRAM),
+          then start it again with the newly selected model/LM.
+        """
+        # If a generation is active, do nothing (button should already be disabled).
+        try:
+            if bool(self.btn_stop.isEnabled()):
+                try:
+                    self._log("NOTE: Can't restart the server while generating. Stop or wait for the run to finish.")
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
         try:
             # Ensure Keep-in-VRAM mode is enabled.
             if hasattr(self, "chk_keep_in_vram") and self.chk_keep_in_vram is not None and (not self.chk_keep_in_vram.isChecked()):
@@ -1824,22 +1849,29 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
         try:
-            self._log("[Keep in VRAM] Restarting API server... (applying model/LM)")
+            self._log("[Keep in VRAM] Restarting API server... (unloading then applying model/LM)")
         except Exception:
             pass
 
-        # Stop if running, then start with current settings.
+        # Show "Starting…" state and disable restart while we cycle.
+        self._set_server_starting(True)
+
+        # 1) Stop/unload (same intent as disabling Keep in VRAM)
         try:
-            if self._api_server is not None and self._api_server.is_running():
+            if self._api_server is not None:
                 self._api_server.stop()
         except Exception:
             pass
 
-        self._set_server_starting(True)
+        # 2) Start again with current settings.
         try:
             self._ensure_api_server_started()
         except Exception:
-            pass
+            # If start fails, unlock the UI so the user can try again.
+            try:
+                self._set_server_starting(False)
+            except Exception:
+                pass
 
     def _is_api_ready(self) -> bool:
         try:
@@ -1848,18 +1880,38 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _set_server_starting(self, starting: bool) -> None:
-        """Lock/unlock Generate while Keep-in-VRAM server is starting."""
+        """Lock/unlock Generate while Keep-in-VRAM server is starting.
+
+        Note: even if a track is currently generating (busy), we still keep the
+        Restart server button disabled to prevent accidental restarts mid-run.
+        """
         try:
             self._server_starting = bool(starting)
         except Exception:
             self._server_starting = bool(starting)
 
-        # Don't fight the 'busy' (generating) state.
+        # Busy == a generation is active (Stop enabled).
         try:
             busy = bool(self.btn_stop.isEnabled())
         except Exception:
             busy = False
 
+        # Keep the restart/start button in sync (always, even while busy).
+        try:
+            if hasattr(self, "btn_restart_server") and self.btn_restart_server is not None:
+                if busy:
+                    self.btn_restart_server.setEnabled(False)
+                elif bool(starting):
+                    self.btn_restart_server.setEnabled(False)
+                    self.btn_restart_server.setText("Starting…")
+                else:
+                    self.btn_restart_server.setEnabled(True)
+                    running = bool(self._api_server is not None and self._api_server.is_running())
+                    self.btn_restart_server.setText("Restart server" if running else "Start server")
+        except Exception:
+            pass
+
+        # While generating, don't touch other controls/banners.
         if busy:
             return
 
@@ -1880,18 +1932,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.banner.setText(getattr(self, "_banner_base_text", "Music Creation with Ace Step 1.5"))
                 if hasattr(self, "banner_progress"):
                     self.banner_progress.setVisible(False)
-            # Keep the restart/start button in sync.
-            try:
-                if hasattr(self, "btn_restart_server") and self.btn_restart_server is not None:
-                    if bool(starting):
-                        self.btn_restart_server.setEnabled(False)
-                        self.btn_restart_server.setText("Starting…")
-                    else:
-                        self.btn_restart_server.setEnabled(True)
-                        running = bool(self._api_server is not None and self._api_server.is_running())
-                        self.btn_restart_server.setText("Restart server" if running else "Start server")
-            except Exception:
-                pass
         except Exception:
             pass
 
@@ -4103,15 +4143,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 "acestep-v15-base",
                 "acestep-v15-sft",
                 "acestep-v15-turbo",
-                "acestep-v15-turbo-rl",
-            ]
+                            ]
         except Exception:
             models = [
                 "acestep-v15-base",
                 "acestep-v15-sft",
                 "acestep-v15-turbo",
-                "acestep-v15-turbo-rl",
-            ]
+                            ]
 
         current = self.cmb_main_model.currentText().strip() if hasattr(self, "cmb_main_model") else ""
         self.cmb_main_model.blockSignals(True)
@@ -5195,6 +5233,22 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self.btn_stop.setEnabled(busy)
+
+        # Safeguard: never allow restarting the server while a generation is running.
+        try:
+            if hasattr(self, "btn_restart_server") and self.btn_restart_server is not None:
+                if busy:
+                    self.btn_restart_server.setEnabled(False)
+                else:
+                    # If the server is currently starting, keep disabled.
+                    if bool(getattr(self, "_server_starting", False)):
+                        self.btn_restart_server.setEnabled(False)
+                    else:
+                        self.btn_restart_server.setEnabled(True)
+                        running = bool(self._api_server is not None and self._api_server.is_running())
+                        self.btn_restart_server.setText("Restart server" if running else "Start server")
+        except Exception:
+            pass
 
         try:
             if busy:
