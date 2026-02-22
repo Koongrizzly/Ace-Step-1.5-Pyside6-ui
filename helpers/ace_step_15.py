@@ -1362,18 +1362,57 @@ def _build_generation_info_headless(
 
 
     def stop(self) -> None:
+        """Stop the API server process and its log reader thread (best effort).
+
+        Important for stability: the reader thread may still be draining stdout when the
+        process is terminated. We wait briefly for it to finish to avoid Qt edge-cases
+        during rapid stop->start cycles (Restart server).
+        """
         self._stop = True
+
+        proc = self._proc
+        thr = self._reader_thread
+
+        # 1) Terminate the process
         try:
-            if self._proc is not None and self._proc.poll() is None:
-                self._proc.terminate()
+            if proc is not None and proc.poll() is None:
                 try:
-                    self._proc.wait(timeout=5)
+                    proc.terminate()
                 except Exception:
-                    self._proc.kill()
+                    pass
+                try:
+                    proc.wait(timeout=6)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+        # 2) Ask the reader thread to quit and wait a moment.
+        try:
+            if thr is not None:
+                try:
+                    thr.quit()
+                except Exception:
+                    pass
+                try:
+                    thr.wait(1500)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3) Clear refs
         self._reader_obj = None
+        self._reader_thread = None
         self._proc = None
+
 
 
 class _ApiLogReader(QtCore.QObject):
@@ -1639,6 +1678,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Optional API server workflow ("Keep in VRAM")
         self._api_server: Optional[ApiServerManager] = None
 
+        # Auto-restart debounce when the user changes model/LM while Keep-in-VRAM is enabled.
+        self._api_restart_timer: Optional[QtCore.QTimer] = None
+        self._api_restart_pending: bool = False
+
+        # Remember last accepted selections so we can revert changes while locked.
+        self._last_main_model_idx: int = -1
+        self._last_lm_model_idx: int = -1
+
         # Generate button busy animation ("Generating…" with dots)
         self._gen_anim_timer: Optional[QtCore.QTimer] = None
         self._gen_anim_phase: int = 0
@@ -1680,6 +1727,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_outputs()
         self._queue_refresh_ui()
 
+        # Snapshot initial model selections (used for revert while locked).
+        try:
+            if hasattr(self, "cmb_main_model") and self.cmb_main_model is not None:
+                self._last_main_model_idx = int(self.cmb_main_model.currentIndex())
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "cmb_lm_model") and self.cmb_lm_model is not None:
+                self._last_lm_model_idx = int(self.cmb_lm_model.currentIndex())
+        except Exception:
+            pass
+
         # Apply System HUD toggle after UI exists.
         try:
             if bool(getattr(self.settings, "system_hud_enabled", False)):
@@ -1700,6 +1759,12 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if bool(getattr(self.settings, "keep_in_vram", False)):
                 self._ensure_api_server_started()
+        except Exception:
+            pass
+
+        # Apply initial lock state (in case we loaded a persisted queue).
+        try:
+            self._update_api_change_locks()
         except Exception:
             pass
         # Startup finished; from now on widget changes may persist settings.
@@ -1761,6 +1826,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._set_server_starting(False)
                     return
                 # Running but not yet ready -> keep Generate disabled.
+                self._server_start_mode = "starting"
                 self._set_server_starting(True)
 
             if not self._api_server.is_running():
@@ -1778,6 +1844,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 lm_model_arg = "" if lm_auto else lm_model
 
                 self._log("[Keep in VRAM] Starting API server... (restart required to apply model/LM changes)")
+                self._server_start_mode = "starting"
                 self._set_server_starting(True)
                 self._api_server.start(main_model=main_model_arg, lm_model=lm_model_arg, lm_auto=lm_auto)
         except Exception:
@@ -1804,6 +1871,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self._set_server_starting(False)
             try:
+                self._update_api_change_locks()
+            except Exception:
+                pass
+            try:
                 if hasattr(self, "btn_restart_server") and self.btn_restart_server is not None:
                     self.btn_restart_server.setText("Start server")
             except Exception:
@@ -1813,6 +1884,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Enabled: start the server (non-blocking).
         try:
             self._ensure_api_server_started()
+        except Exception:
+            pass
+        try:
+            self._update_api_change_locks()
         except Exception:
             pass
 
@@ -1853,7 +1928,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # Show "Starting…" state and disable restart while we cycle.
+        # Show \"Starting…\" state and disable restart while we cycle.
+        self._server_start_mode = "switching"
         self._set_server_starting(True)
 
         # 1) Stop/unload (same intent as disabling Keep in VRAM)
@@ -1865,13 +1941,213 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 2) Start again with current settings.
         try:
-            self._ensure_api_server_started()
+            
+            # Give the OS a moment to release the port / CUDA context after terminate().
+            try:
+                QtCore.QTimer.singleShot(350, self._ensure_api_server_started)
+            except Exception:
+                self._ensure_api_server_started()
         except Exception:
             # If start fails, unlock the UI so the user can try again.
             try:
                 self._set_server_starting(False)
             except Exception:
                 pass
+
+    def _api_change_locked(self) -> bool:
+        """True when we should prevent model/LM/Keep-in-VRAM changes.
+
+        Only lock these controls when Keep-in-VRAM is enabled. CLI runs reload
+        every time, so changing selections mid-run does not risk cancelling an
+        in-flight API job.
+        """
+        try:
+            keep = bool(getattr(self.settings, "keep_in_vram", False))
+            if hasattr(self, "chk_keep_in_vram") and self.chk_keep_in_vram is not None:
+                keep = bool(self.chk_keep_in_vram.isChecked())
+        except Exception:
+            keep = bool(getattr(self.settings, "keep_in_vram", False))
+
+        if not keep:
+            return False
+
+        try:
+            starting = bool(getattr(self, "_server_starting", False))
+        except Exception:
+            starting = False
+
+        try:
+            running = bool(self._is_running())
+        except Exception:
+            running = False
+
+        try:
+            has_queue = bool(self._queue)
+        except Exception:
+            has_queue = False
+
+        return bool(starting or running or has_queue)
+
+    def _update_api_change_locks(self) -> None:
+        """Enable/disable UI controls that can cancel jobs when Keep-in-VRAM is enabled."""
+        locked = False
+        try:
+            locked = bool(self._api_change_locked())
+        except Exception:
+            locked = False
+
+        # Only lock the things that can disrupt jobs: Keep-in-VRAM toggle,
+        # the restart button, and the model/LM selectors.
+        try:
+            if hasattr(self, "chk_keep_in_vram") and self.chk_keep_in_vram is not None:
+                self.chk_keep_in_vram.setEnabled(not locked)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "btn_restart_server") and self.btn_restart_server is not None:
+                self.btn_restart_server.setEnabled(not locked)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "cmb_main_model") and self.cmb_main_model is not None:
+                self.cmb_main_model.setEnabled(not locked)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "cmb_lm_model") and self.cmb_lm_model is not None:
+                self.cmb_lm_model.setEnabled(not locked)
+        except Exception:
+            pass
+
+    def _schedule_api_restart(self, reason: str = "") -> None:
+        """Debounced auto-restart for the API server after model/LM changes."""
+        # Only relevant when Keep-in-VRAM is enabled.
+        try:
+            if hasattr(self, "chk_keep_in_vram") and self.chk_keep_in_vram is not None:
+                if not self.chk_keep_in_vram.isChecked():
+                    return
+        except Exception:
+            return
+
+        # If we're locked (busy/queue/starting), do not schedule.
+        if self._api_change_locked():
+            return
+
+        # Coalesce multiple rapid changes.
+        self._api_restart_pending = True
+        if self._api_restart_timer is None:
+            self._api_restart_timer = QtCore.QTimer(self)
+            self._api_restart_timer.setSingleShot(True)
+            self._api_restart_timer.timeout.connect(self._run_pending_api_restart)
+
+        try:
+            # If the user changes model then LM quickly, restart once.
+            self._api_restart_timer.start(650)
+        except Exception:
+            self._run_pending_api_restart()
+
+        try:
+            if reason:
+                self._log(f"[Keep in VRAM] Selection changed ({reason}). Restarting server to apply…")
+        except Exception:
+            pass
+
+    def _run_pending_api_restart(self) -> None:
+        if not bool(getattr(self, "_api_restart_pending", False)):
+            return
+        self._api_restart_pending = False
+
+        # Double-check locks at execution time.
+        if self._api_change_locked():
+            return
+
+        try:
+            self._on_restart_server_clicked()
+        except Exception:
+            pass
+
+    def _revert_combo_index(self, combo: QtWidgets.QComboBox, idx: int) -> None:
+        try:
+            combo.blockSignals(True)
+            if idx >= 0 and idx < combo.count():
+                combo.setCurrentIndex(idx)
+        finally:
+            try:
+                combo.blockSignals(False)
+            except Exception:
+                pass
+
+    def _on_main_model_changed(self, *_args) -> None:
+        # During startup/settings-apply, accept changes without restarts.
+        if bool(getattr(self, "_loading_settings", False)):
+            try:
+                self._last_main_model_idx = int(self.cmb_main_model.currentIndex())
+            except Exception:
+                pass
+            return
+
+        # If Keep-in-VRAM is on and we're busy/queued/starting, revert.
+        if self._api_change_locked():
+            try:
+                self._revert_combo_index(self.cmb_main_model, int(getattr(self, "_last_main_model_idx", -1)))
+            except Exception:
+                pass
+            try:
+                self._log("NOTE: Can't change the main model while jobs are running/queued (Keep in VRAM).")
+            except Exception:
+                pass
+            return
+
+        # Accept selection.
+        try:
+            self._last_main_model_idx = int(self.cmb_main_model.currentIndex())
+        except Exception:
+            pass
+
+        # Persist and auto-restart (Keep-in-VRAM only).
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "chk_keep_in_vram") and self.chk_keep_in_vram is not None and self.chk_keep_in_vram.isChecked():
+                self._schedule_api_restart("main model")
+        except Exception:
+            pass
+
+    def _on_lm_model_changed(self, *_args) -> None:
+        if bool(getattr(self, "_loading_settings", False)):
+            try:
+                self._last_lm_model_idx = int(self.cmb_lm_model.currentIndex())
+            except Exception:
+                pass
+            return
+
+        if self._api_change_locked():
+            try:
+                self._revert_combo_index(self.cmb_lm_model, int(getattr(self, "_last_lm_model_idx", -1)))
+            except Exception:
+                pass
+            try:
+                self._log("NOTE: Can't change the LLM while jobs are running/queued (Keep in VRAM).")
+            except Exception:
+                pass
+            return
+
+        try:
+            self._last_lm_model_idx = int(self.cmb_lm_model.currentIndex())
+        except Exception:
+            pass
+
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "chk_keep_in_vram") and self.chk_keep_in_vram is not None and self.chk_keep_in_vram.isChecked():
+                self._schedule_api_restart("LLM")
+        except Exception:
+            pass
 
     def _is_api_ready(self) -> bool:
         try:
@@ -1907,31 +2183,70 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     self.btn_restart_server.setEnabled(True)
                     running = bool(self._api_server is not None and self._api_server.is_running())
-                    self.btn_restart_server.setText("Restart server" if running else "Start server")
+                    self.btn_restart_server.setText("Restart server to load another model/LM" if running else "Start server")
         except Exception:
             pass
 
         # While generating, don't touch other controls/banners.
         if busy:
+            try:
+                self._queue_update_details_from_selection()
+            except Exception:
+                pass
+            try:
+                self._update_api_change_locks()
+            except Exception:
+                pass
             return
 
         try:
             if bool(getattr(self.settings, "keep_in_vram", False)) and self._server_starting:
                 # Keep enabled so the user can queue jobs while the server warms up.
                 self.btn_run.setEnabled(True)
+
+                mode = str(getattr(self, "_server_start_mode", "starting") or "starting").lower().strip()
+                label = "Switching model/LM" if mode == "switching" else "Starting API server"
+
+                # Drive the same text-only spinner used for Generating, but with a different label.
+                try:
+                    if self._gen_anim_timer is not None and (not self._gen_anim_timer.isActive()):
+                        self._gen_anim_phase = 0
+                        self._gen_anim_timer.start()
+                except Exception:
+                    pass
+                try:
+                    self.btn_run.setText(f"{label} …")
+                except Exception:
+                    pass
+
                 # Banner + progress bar
                 if hasattr(self, "banner"):
-                    self.banner.setText("Starting server")
+                    self.banner.setText(label)
                 if hasattr(self, "banner_progress"):
                     self.banner_progress.setVisible(True)
             else:
-                # Only re-enable if not busy and not starting
-                if hasattr(self, "btn_run"):
-                    self.btn_run.setEnabled(True)
+                # Leaving starting/switching state. Restore button text if we're not actively generating.
+                try:
+                    if self._gen_anim_timer is not None and (not self.btn_stop.isEnabled()):
+                        self._gen_anim_timer.stop()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "btn_run") and (not self.btn_stop.isEnabled()):
+                        self.btn_run.setEnabled(True)
+                        self.btn_run.setText(getattr(self, "_gen_btn_base_text", "Generate"))
+                except Exception:
+                    pass
+
                 if hasattr(self, "banner"):
                     self.banner.setText(getattr(self, "_banner_base_text", "Music Creation with Ace Step 1.5"))
                 if hasattr(self, "banner_progress"):
                     self.banner_progress.setVisible(False)
+        except Exception:
+            pass
+
+        try:
+            self._update_api_change_locks()
         except Exception:
             pass
 
@@ -1944,14 +2259,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_server_starting(False)
 
     def _tick_generate_anim(self) -> None:
-        """Animate the Generate button + banner while a run is active (braille spinner)."""
+        """Animate the Generate button while generating or while the API server is starting/switching."""
+        # Determine current mode.
         try:
-            # If we're no longer busy, stop the timer.
-            if not self.btn_stop.isEnabled():
+            generating = bool(self.btn_stop.isEnabled())
+        except Exception:
+            generating = False
+        try:
+            starting = bool(getattr(self, "_server_starting", False))
+        except Exception:
+            starting = False
+
+        # If nothing is happening, stop the timer and restore the base label.
+        if (not generating) and (not starting):
+            try:
                 if self._gen_anim_timer is not None:
                     self._gen_anim_timer.stop()
-                return
-        except Exception:
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "btn_run"):
+                    self.btn_run.setText(getattr(self, "_gen_btn_base_text", "Generate"))
+            except Exception:
+                pass
             return
 
         frames = getattr(self, "_spin_frames", None)
@@ -1961,19 +2291,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._gen_anim_phase = (self._gen_anim_phase + 1) % len(frames)
         f1 = frames[self._gen_anim_phase]
-        f2 = frames[(self._gen_anim_phase + 1) % len(frames)]
-        f3 = frames[(self._gen_anim_phase + 2) % len(frames)]
 
-        # Button: small, single-character spinner (constant width)
+        # GENERATING
+        if generating:
+            try:
+                self.btn_run.setText(f"Generating {f1}  (click to queue)")
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "banner") and hasattr(self, "banner_progress"):
+                    self.banner.setText("Generating")
+            except Exception:
+                pass
+            return
+
+        # STARTING / SWITCHING API SERVER
+        mode = str(getattr(self, "_server_start_mode", "starting") or "starting").lower().strip()
+        label = "Switching model/LM" if mode == "switching" else "Starting API server"
+
         try:
-            self.btn_run.setText(f"Generating {f1}  (click to queue)")
+            self.btn_run.setText(f"{label} {f1}")
         except Exception:
             pass
 
-        # Banner: progress animation handled by self.banner_progress (if present)
         try:
-            if hasattr(self, "banner") and hasattr(self, "banner_progress") and self.btn_stop.isEnabled():
-                self.banner.setText("Generating")
+            if hasattr(self, "banner") and hasattr(self, "banner_progress"):
+                self.banner.setText(label)
+                self.banner_progress.setVisible(True)
         except Exception:
             pass
 
@@ -2131,7 +2475,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_ui_timer.setInterval(5000)
         self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=True))
         self._queue_ui_timer.start()
-        tq.addWidget(self.tbl_queue, 1)
+        self._queue_ui_timer.start()
+
+        # Split view: queue table (top) + selected job details (bottom)
+        self._queue_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self._queue_splitter.setObjectName("ace15_queue_splitter")
+        self._queue_splitter.addWidget(self.tbl_queue)
+
+        gb_qdetails = QtWidgets.QGroupBox("Job details")
+        gb_qdetails.setObjectName("ace15_queue_details_group")
+        qd_l = QtWidgets.QVBoxLayout(gb_qdetails)
+        qd_l.setContentsMargins(10, 10, 10, 10)
+        qd_l.setSpacing(8)
+
+        qd_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_queue_copy_details = QtWidgets.QPushButton("Copy")
+        self.btn_queue_open_folder = QtWidgets.QPushButton("Open folder")
+        self.btn_queue_open_config = QtWidgets.QPushButton("Open config")
+        qd_btn_row.addWidget(self.btn_queue_copy_details)
+        qd_btn_row.addWidget(self.btn_queue_open_folder)
+        qd_btn_row.addWidget(self.btn_queue_open_config)
+        qd_btn_row.addStretch(1)
+        qd_l.addLayout(qd_btn_row)
+
+        self.ed_queue_details = QtWidgets.QPlainTextEdit()
+        self.ed_queue_details.setObjectName("ace15_queue_details")
+        self.ed_queue_details.setReadOnly(True)
+        try:
+            self.ed_queue_details.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        except Exception:
+            pass
+        qd_l.addWidget(self.ed_queue_details, 1)
+
+        self._queue_splitter.addWidget(gb_qdetails)
+        try:
+            self._queue_splitter.setStretchFactor(0, 3)
+            self._queue_splitter.setStretchFactor(1, 2)
+            self._queue_splitter.setSizes([420, 220])
+        except Exception:
+            pass
+
+        tq.addWidget(self._queue_splitter, 1)
+
+        # Keep details updated
+        try:
+            self.tbl_queue.itemSelectionChanged.connect(self._queue_update_details_from_selection)
+        except Exception:
+            pass
+        self.btn_queue_copy_details.clicked.connect(self._queue_copy_details)
+        self.btn_queue_open_folder.clicked.connect(self._queue_open_selected_job_folder)
+        self.btn_queue_open_config.clicked.connect(self._queue_open_selected_job_config)
 
         row_qbtn = QtWidgets.QHBoxLayout()
         self.btn_queue_start_next = QtWidgets.QPushButton("Start next")
@@ -2778,15 +3171,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_refresh_main.clicked.connect(self._refresh_main_models)
         try:
             self.cmb_main_model.currentIndexChanged.connect(self._update_shift_ui)
+            self.cmb_main_model.currentIndexChanged.connect(lambda *_: self._update_steps_from_main_model(force=True))
+            self.cmb_main_model.currentIndexChanged.connect(self._on_main_model_changed)
         except Exception:
             pass
         form.addRow("Main model", self._row(self.cmb_main_model, self.btn_refresh_main))
+
+        # Ensure Steps reflects the initial Main model selection.
+        try:
+            self._update_steps_from_main_model(force=False)
+        except Exception:
+            pass
 
         self.cmb_lm_model = QtWidgets.QComboBox()
         self.cmb_lm_model.setToolTip("Select a specific LM model. First use will auto-download into checkpoints/ (progress in logs).")
         self.btn_refresh_lm = QtWidgets.QPushButton("Refresh LM list")
         self.btn_refresh_lm.setToolTip("Scan project_root/checkpoints and repopulate this list.")
         self.btn_refresh_lm.clicked.connect(self._refresh_lm_models)
+        try:
+            self.cmb_lm_model.currentIndexChanged.connect(self._on_lm_model_changed)
+        except Exception:
+            pass
         form.addRow("LLM model", self._row(self.cmb_lm_model, self.btn_refresh_lm))
 
         # Advanced paths (read-only)
@@ -3408,6 +3813,133 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
         return False
 
+    
+    def _ace15_desired_steps(self, main_sel: str) -> int:
+        """Return desired inference steps based on main model selection.
+        Rules:
+        - Turbo variants -> 8 steps
+        - Base/SFT (and everything else) -> 50 steps
+        """
+        s = (main_sel or "").strip().lower()
+        # Try to be robust: look at both filename and full path.
+        if "turbo" in s:
+            return 8
+        return 50
+
+    def _update_steps_from_main_model(self, force: bool = True) -> None:
+        """Update the Steps spinbox immediately when the main model selection changes."""
+        if not hasattr(self, "spin_steps") or self.spin_steps is None:
+            return
+        if not hasattr(self, "cmb_main_model") or self.cmb_main_model is None:
+            return
+
+        sel = ""
+        try:
+            sel = str(self.cmb_main_model.currentData() or "").strip()
+        except Exception:
+            sel = ""
+        if not sel:
+            try:
+                sel = str(self.cmb_main_model.currentText() or "").strip()
+            except Exception:
+                sel = ""
+
+        target = self._ace15_desired_steps(sel)
+
+        try:
+            cur = int(self.spin_steps.value())
+        except Exception:
+            cur = 0
+
+        changed = (cur != int(target))
+
+        # If force=True, always snap to the rule value on model switch.
+        # If force=False, only apply when Steps is still at auto/default (0).
+        if (not force) and (cur != 0):
+            return
+
+        try:
+            # Avoid recursive signals if any listeners depend on valueChanged.
+            was_blocked = self.spin_steps.blockSignals(True)
+            self.spin_steps.setValue(int(target))
+            self.spin_steps.blockSignals(was_blocked)
+        except Exception:
+            try:
+                self.spin_steps.setValue(int(target))
+            except Exception:
+                pass
+
+        # Small UX: show a toast when we auto-snap Steps based on model selection.
+        if changed:
+            s_low = (sel or "").strip().lower()
+            if "turbo" in s_low:
+                self._show_toast("Turbo model detected → Steps set to 8", msec=3000)
+            else:
+                self._show_toast("Base/SFT model detected → Steps set to 50", msec=3000)
+
+    def _show_toast(self, text: str, msec: int = 3000) -> None:
+        """Show a small non-intrusive toast message inside the main window."""
+        try:
+            if not hasattr(self, "_toast_label") or self._toast_label is None:
+                lbl = QtWidgets.QLabel(self)
+                lbl.setObjectName("toast_label")
+                lbl.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+                lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+                lbl.setWordWrap(True)
+                # Simple neutral style that works across themes.
+                lbl.setStyleSheet(
+                    "QLabel#toast_label {"
+                    "background: rgba(20,20,20,200);"
+                    "color: white;"
+                    "border-radius: 10px;"
+                    "padding: 10px 12px;"
+                    "font-size: 12px;"
+                    "}"
+                )
+                lbl.hide()
+                self._toast_label = lbl
+
+            lbl = self._toast_label
+            lbl.setText(str(text))
+            lbl.adjustSize()
+
+            # Position bottom-right with safe margins.
+            margin_x = 18
+            margin_y = 18
+            w = lbl.width()
+            h = lbl.height()
+
+            x = max(margin_x, int(self.width() - w - margin_x))
+            y = max(margin_y, int(self.height() - h - margin_y))
+
+            # If we have a status bar, keep the toast above it.
+            try:
+                if self.statusBar() is not None and self.statusBar().isVisible():
+                    sb_h = int(self.statusBar().height())
+                    y = max(margin_y, int(self.height() - h - margin_y - sb_h))
+            except Exception:
+                pass
+
+            lbl.move(x, y)
+            lbl.raise_()
+            lbl.show()
+
+            # Auto-hide after duration.
+            try:
+                if hasattr(self, "_toast_timer") and self._toast_timer is not None:
+                    self._toast_timer.stop()
+            except Exception:
+                pass
+
+            t = QtCore.QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(lambda: getattr(self, "_toast_label", None) and self._toast_label.hide())
+            t.start(int(msec))
+            self._toast_timer = t
+        except Exception:
+            # Never let a toast crash the app.
+            return
+
     def _update_shift_ui(self) -> None:
         """Enable/disable Shift based on the selected main model."""
         if not hasattr(self, "spin_shift") or not hasattr(self, "cmb_main_model"):
@@ -3600,6 +4132,13 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             lm_sel = ""
 
+        # Resolve Steps when set to auto/default (0) based on the selected Main model.
+        try:
+            if int(steps) == 0:
+                steps = int(self._ace15_desired_steps(main_sel))
+        except Exception:
+            pass
+
         # Build a compact, UI-focused payload. We intentionally do NOT store duration/seed/batch/audio_format/etc.
         payload: dict = {
             # Required (what the preset manager should save)
@@ -3661,6 +4200,23 @@ class MainWindow(QtWidgets.QMainWindow):
         return payload
 
     def _ace15_apply_preset_payload(self, preset: dict) -> None:
+        # If the preset does not explicitly set Steps (or sets it to 0/auto),
+        # we auto-snap Steps based on the selected Main model after applying
+        # the model selection. This keeps "auto steps" working for presets
+        # that only change model/LM.
+        _preset_steps_explicit: bool = False
+        _preset_steps_value: int = 0
+        try:
+            if isinstance(preset, dict):
+                if "steps" in preset or "inference_steps" in preset:
+                    _preset_steps_explicit = True
+                    if "steps" in preset:
+                        _preset_steps_value = int(preset.get("steps") or 0)
+                    else:
+                        _preset_steps_value = int(preset.get("inference_steps") or 0)
+        except Exception:
+            _preset_steps_explicit = False
+            _preset_steps_value = 0
         """Apply a preset payload back into the UI."""
         if not isinstance(preset, dict):
             return
@@ -3925,6 +4481,15 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # If Steps was not explicitly set (or set to 0/auto), force-update it
+        # from the chosen Main model. This fixes the case where applying a genre
+        # preset changes model/LM but leaves Steps from the previous selection.
+        try:
+            if (not _preset_steps_explicit) or (int(_preset_steps_value) <= 0):
+                self._update_steps_from_main_model(force=True)
+        except Exception:
+            pass
+
         # Optional: persist after apply
         try:
             self._save_settings()
@@ -4163,6 +4728,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.cmb_main_model.setCurrentIndex(i)
         self.cmb_main_model.blockSignals(False)
 
+        # Keep revert snapshot in sync after list rebuilds.
+        try:
+            self._last_main_model_idx = int(self.cmb_main_model.currentIndex())
+        except Exception:
+            pass
+
         try:
             self._update_shift_ui()
         except Exception:
@@ -4200,6 +4771,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if i >= 0:
                 self.cmb_lm_model.setCurrentIndex(i)
         self.cmb_lm_model.blockSignals(False)
+
+        try:
+            self._last_lm_model_idx = int(self.cmb_lm_model.currentIndex())
+        except Exception:
+            pass
 
     def _validate(self) -> Optional[str]:
         envpy = Path(self.ed_envpy.text().strip())
@@ -4701,6 +5277,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.btn_queue_clear.setEnabled(len(self._queue) > 0)
             except Exception:
                 pass
+            try:
+                self._update_api_change_locks()
+            except Exception:
+                pass
             return
 
         try:
@@ -4750,6 +5330,245 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.btn_queue_start_next.setEnabled((not self._is_running()) and len(self._queue) > 0)
             self.btn_queue_clear.setEnabled(len(self._queue) > 0)
+        except Exception:
+            pass
+
+        try:
+            self._queue_update_details_from_selection()
+        except Exception:
+            pass
+
+        # Keep model/LM/Keep-in-VRAM controls locked while queued jobs exist.
+        try:
+            self._update_api_change_locks()
+        except Exception:
+            pass
+
+
+    def _queue_find_job_by_id(self, job_id: int) -> Optional[QueueJob]:
+        try:
+            if self._active_job is not None and int(self._active_job.job_id) == int(job_id):
+                return self._active_job
+        except Exception:
+            pass
+        try:
+            for j in list(self._queue or []):
+                if int(j.job_id) == int(job_id):
+                    return j
+        except Exception:
+            pass
+        return None
+
+    def _queue_get_selected_job_id(self) -> Optional[int]:
+        try:
+            sel = self.tbl_queue.selectionModel().selectedRows()
+            if not sel:
+                return None
+            r = int(sel[0].row())
+            it = self.tbl_queue.item(r, 0)
+            if it is None:
+                return None
+            v = it.data(QtCore.Qt.UserRole)
+            if v is None:
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    def _queue_format_job_details(self, job: QueueJob, status: str = "") -> str:
+        # Best-effort formatting; never throw inside UI refresh paths.
+        try:
+            created = ""
+            try:
+                created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(job.created_epoch or 0.0)))
+            except Exception:
+                created = ""
+            use_api = bool(getattr(job, "use_api", False))
+            mode = "API (Keep in VRAM)" if use_api else "CLI"
+            lines: list[str] = []
+            lines.append(f"Job #{job.job_id}    {status}".strip())
+            if created:
+                lines.append(f"Created: {created}")
+            lines.append(f"Mode: {mode}")
+            if getattr(job, "subgenre_for_naming", ""):
+                lines.append(f"Subgenre (snapshotted): {job.subgenre_for_naming}")
+            if getattr(job, "title", ""):
+                lines.append(f"Title: {job.title}")
+            if getattr(job, "task_type", ""):
+                lines.append(f"Task: {job.task_type}")
+            try:
+                if float(job.duration_s or 0.0) > 0:
+                    lines.append(f"Duration: {float(job.duration_s):.2f}s")
+            except Exception:
+                pass
+            try:
+                bs = int(job.batch_size or 1)
+                lines.append(f"Tracks: {max(1, bs)}")
+            except Exception:
+                pass
+            if getattr(job, "seed", "") != "":
+                lines.append(f"Seed: {job.seed}")
+
+            # Paths
+            try:
+                if getattr(job, "out_dir", None):
+                    lines.append(f"Output folder: {str(job.out_dir)}")
+            except Exception:
+                pass
+            try:
+                if getattr(job, "cfg_path", None):
+                    lines.append(f"Config: {str(job.cfg_path)}")
+            except Exception:
+                pass
+            try:
+                if getattr(job, "cli_cwd", None):
+                    lines.append(f"Working dir: {str(job.cli_cwd)}")
+            except Exception:
+                pass
+
+            # CLI args (short)
+            try:
+                ca = getattr(job, "cli_args", None)
+                if ca:
+                    lines.append("")
+                    lines.append("CLI args:")
+                    joined = " ".join([str(x) for x in ca])
+                    lines.append(joined)
+            except Exception:
+                pass
+
+            # API info (high level)
+            try:
+                if use_api:
+                    if getattr(job, "api_base_url", ""):
+                        lines.append("")
+                        lines.append(f"API base URL: {job.api_base_url}")
+                    ap = getattr(job, "api_payload", None)
+                    if isinstance(ap, dict) and ap:
+                        lines.append("")
+                        lines.append("API payload (highlights):")
+                        # Show important keys first if present
+                        prio = [
+                            "model_name", "lm_name", "duration", "task", "seed", "batch_size",
+                            "prompt", "caption", "lyrics", "negative_prompt",
+                            "enable_lm", "thinking", "parallel_thinking", "enable_prompt_enhance",
+                        ]
+                        seen = set()
+                        for k in prio:
+                            if k in ap:
+                                v = ap.get(k)
+                                sv = str(v)
+                                if len(sv) > 180:
+                                    sv = sv[:180] + "…"
+                                lines.append(f"  {k}: {sv}")
+                                seen.add(k)
+                        # Then show a few more keys
+                        extra = [k for k in ap.keys() if k not in seen]
+                        extra = sorted(extra)[:12]
+                        for k in extra:
+                            v = ap.get(k)
+                            sv = str(v)
+                            if len(sv) > 180:
+                                sv = sv[:180] + "…"
+                            lines.append(f"  {k}: {sv}")
+            except Exception:
+                pass
+
+            return "\n".join(lines).strip() + "\n"
+        except Exception:
+            try:
+                return f"Job #{getattr(job, 'job_id', '?')}\n"
+            except Exception:
+                return "Job\n"
+
+    def _queue_update_details_from_selection(self) -> None:
+        try:
+            if not hasattr(self, "ed_queue_details") or self.ed_queue_details is None:
+                return
+        except Exception:
+            return
+
+        job_id = self._queue_get_selected_job_id()
+        if job_id is None:
+            try:
+                self.ed_queue_details.setPlainText("Select a job to see details.\n")
+                self.btn_queue_copy_details.setEnabled(False)
+                self.btn_queue_open_folder.setEnabled(False)
+                self.btn_queue_open_config.setEnabled(False)
+            except Exception:
+                pass
+            return
+
+        job = self._queue_find_job_by_id(job_id)
+        if job is None:
+            try:
+                self.ed_queue_details.setPlainText("Job not found (it may have finished).\n")
+            except Exception:
+                pass
+            return
+
+        status = "Queued"
+        try:
+            if self._active_job is not None and int(self._active_job.job_id) == int(job_id):
+                status = "Running"
+        except Exception:
+            pass
+
+        txt = self._queue_format_job_details(job, status=status)
+        try:
+            self.ed_queue_details.setPlainText(txt)
+        except Exception:
+            pass
+
+        # Enable/disable buttons based on available paths
+        try:
+            self.btn_queue_copy_details.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            od = getattr(job, "out_dir", None)
+            self.btn_queue_open_folder.setEnabled(bool(od and Path(str(od)).exists()))
+        except Exception:
+            pass
+        try:
+            cp = getattr(job, "cfg_path", None)
+            self.btn_queue_open_config.setEnabled(bool(cp and Path(str(cp)).exists()))
+        except Exception:
+            pass
+
+    def _queue_copy_details(self) -> None:
+        try:
+            if hasattr(self, "ed_queue_details") and self.ed_queue_details is not None:
+                txt = self.ed_queue_details.toPlainText()
+                QtWidgets.QApplication.clipboard().setText(txt or "")
+        except Exception:
+            pass
+
+    def _queue_open_selected_job_folder(self) -> None:
+        job_id = self._queue_get_selected_job_id()
+        if job_id is None:
+            return
+        job = self._queue_find_job_by_id(job_id)
+        if job is None:
+            return
+        try:
+            p = Path(str(job.out_dir))
+            if p.exists():
+                open_in_explorer(p)
+        except Exception:
+            pass
+
+    def _queue_open_selected_job_config(self) -> None:
+        job_id = self._queue_get_selected_job_id()
+        if job_id is None:
+            return
+        job = self._queue_find_job_by_id(job_id)
+        if job is None:
+            return
+        try:
+            p = Path(str(job.cfg_path))
+            if p.exists():
+                open_in_explorer(p.parent)
         except Exception:
             pass
 
@@ -5247,6 +6066,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.btn_restart_server.setEnabled(True)
                         running = bool(self._api_server is not None and self._api_server.is_running())
                         self.btn_restart_server.setText("Restart server" if running else "Start server")
+        except Exception:
+            pass
+
+        # Also lock model/LM/Keep-in-VRAM controls while busy/queued in Keep-in-VRAM mode.
+        try:
+            self._update_api_change_locks()
         except Exception:
             pass
 
