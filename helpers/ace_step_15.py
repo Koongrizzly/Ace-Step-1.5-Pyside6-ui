@@ -1671,6 +1671,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_job: Optional[QueueJob] = None
         self._queue_pump_timer: Optional[QtCore.QTimer] = None
 
+
+        # Finished jobs (last 25 successful runs; each job may contain multiple tracks)
+        self._finished_jobs: list[dict] = []
         # Load persisted queue (best-effort). If the app was closed while a job
         # was running, we treat it as pending again on next start.
         self._queue_load()
@@ -2189,6 +2192,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # While generating, don't touch other controls/banners.
         if busy:
+            return
+
+        if refresh_details:
             try:
                 self._queue_update_details_from_selection()
             except Exception:
@@ -2439,6 +2445,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_queue_state.setObjectName("ace15_queue_state")
         tq.addWidget(self.lbl_queue_state, 0)
 
+        # Main split: left = running/queued, right = finished
+        self._queue_main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self._queue_main_splitter.setObjectName("ace15_queue_main_splitter")
+
+        # -------------------------
+        # Left side (running + queued)
+        # -------------------------
+        left = QtWidgets.QWidget()
+        left_l = QtWidgets.QVBoxLayout(left)
+        left_l.setContentsMargins(0, 0, 0, 0)
+        left_l.setSpacing(10)
+
         self.tbl_queue = QtWidgets.QTableWidget(0, 7)
         self.tbl_queue.setObjectName("ace15_queue_table")
         self.tbl_queue.setHorizontalHeaderLabels([
@@ -2464,7 +2482,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tbl_queue.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)
         except Exception:
             pass
-        
+
         # Queue table: refresh is throttled to avoid fighting row selection.
         self.tbl_queue.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tbl_queue.customContextMenuRequested.connect(self._queue_context_menu)
@@ -2473,7 +2491,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_last_ui_refresh = 0.0
         self._queue_ui_timer = QtCore.QTimer(self)
         self._queue_ui_timer.setInterval(5000)
-        self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=True))
+        self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=True, refresh_details=False))
         self._queue_ui_timer.start()
         self._queue_ui_timer.start()
 
@@ -2515,7 +2533,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        tq.addWidget(self._queue_splitter, 1)
+        left_l.addWidget(self._queue_splitter, 1)
 
         # Keep details updated
         try:
@@ -2537,9 +2555,54 @@ class MainWindow(QtWidgets.QMainWindow):
         row_qbtn.addStretch(1)
         row_qbtn.addWidget(self.btn_queue_remove)
         row_qbtn.addWidget(self.btn_queue_clear)
-        tq.addLayout(row_qbtn)
+        left_l.addLayout(row_qbtn)
+
+        self._queue_main_splitter.addWidget(left)
 
         # -------------------------
+        # Right side (Finished: last 25 jobs)
+        # -------------------------
+        right = QtWidgets.QGroupBox("Finished (last 25)")
+        right.setObjectName("ace15_finished_group")
+        right_l = QtWidgets.QVBoxLayout(right)
+        right_l.setContentsMargins(10, 10, 10, 10)
+        right_l.setSpacing(8)
+
+        self.tree_finished = QtWidgets.QTreeWidget()
+        self.tree_finished.setObjectName("ace15_finished_tree")
+        self.tree_finished.setColumnCount(2)
+        self.tree_finished.setHeaderLabels(["Job / Track", "Tracks"])
+        try:
+            self.tree_finished.header().setStretchLastSection(False)
+            self.tree_finished.header().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+            self.tree_finished.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        except Exception:
+            pass
+        self.tree_finished.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.tree_finished.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tree_finished.customContextMenuRequested.connect(self._finished_context_menu)
+        self.tree_finished.itemSelectionChanged.connect(self._finished_update_details_from_selection)
+        self.tree_finished.itemDoubleClicked.connect(lambda _item, _col: self._finished_play_from_payload(self._finished_get_selected_payload() or {}))
+        right_l.addWidget(self.tree_finished, 1)
+
+        self._queue_main_splitter.addWidget(right)
+
+        try:
+            self._queue_main_splitter.setStretchFactor(0, 3)
+            self._queue_main_splitter.setStretchFactor(1, 2)
+            self._queue_main_splitter.setSizes([700, 420])
+        except Exception:
+            pass
+
+        tq.addWidget(self._queue_main_splitter, 1)
+
+        # Initial finished list build
+        try:
+            self._finished_refresh_ui()
+        except Exception:
+            pass
+
+# -------------------------
         # Tab 3: Advanced (scrollable)
         # -------------------------
         tab_adv = QtWidgets.QWidget()
@@ -5059,10 +5122,11 @@ class MainWindow(QtWidgets.QMainWindow):
             jobs.extend(list(self._queue or []))
 
             payload = {
-                "version": 1,
+                "version": 2,
                 "saved_epoch": time.time(),
                 "next_job_id": int(getattr(self, "_next_job_id", 1) or 1),
                 "jobs": [j.to_dict() for j in jobs],
+                "finished_jobs": list(self._finished_jobs[-25:]) if getattr(self, "_finished_jobs", None) else [],
             }
 
             tmp = p.with_suffix(p.suffix + ".tmp")
@@ -5102,6 +5166,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._active_job = None
             self._queue = jobs
 
+            # Load finished jobs list (last 25), if present.
+            fin = data.get("finished_jobs", [])
+            if isinstance(fin, list):
+                # Keep only dict entries and cap to 25.
+                self._finished_jobs = [x for x in fin if isinstance(x, dict)][-25:]
+            else:
+                self._finished_jobs = []
+
             max_id = max([int(j.job_id) for j in jobs], default=0)
             try:
                 nxt = int(data.get("next_job_id", 0) or 0)
@@ -5111,6 +5183,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             # Corrupt file -> ignore
             self._queue = []
+            self._finished_jobs = []
             self._next_job_id = 1
 
     def _is_running(self) -> bool:
@@ -5242,7 +5315,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return job
 
-    def _queue_refresh_ui(self, force: bool = False) -> None:
+    def _queue_refresh_ui(self, force: bool = False, refresh_details: bool = True) -> None:
 
         # Throttle full table rebuilds; they can interrupt row selection.
         now = time.time()
@@ -5284,8 +5357,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
+            self.tbl_queue.blockSignals(True)
+        except Exception:
+            pass
+
+        try:
             self.tbl_queue.setRowCount(0)
         except Exception:
+            try:
+                self.tbl_queue.blockSignals(False)
+            except Exception:
+                pass
             return
 
         rows: list[tuple[str, str, QueueJob]] = []
@@ -5333,10 +5415,25 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Only refresh the details pane when explicitly requested.
+        # Background refreshes (queue pump + 5s UI refresh) should not reset/overwrite
+        # the details text, otherwise it becomes impossible to read/scroll.
+        if refresh_details:
+            try:
+                self._queue_update_details_from_selection()
+            except Exception:
+                pass
+
+        # Do not let auto refresh fight scrolling in the details panel.
+
         try:
-            self._queue_update_details_from_selection()
+
+            self.tbl_queue.blockSignals(False)
+
         except Exception:
+
             pass
+
 
         # Keep model/LM/Keep-in-VRAM controls locked while queued jobs exist.
         try:
@@ -5545,30 +5642,49 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _queue_open_selected_job_folder(self) -> None:
+        # Prefer queued/running selection.
         job_id = self._queue_get_selected_job_id()
-        if job_id is None:
+        if job_id is not None:
+            job = self._queue_find_job_by_id(job_id)
+            if job is not None:
+                try:
+                    p = Path(str(job.out_dir))
+                    if p.exists():
+                        open_in_explorer(p)
+                except Exception:
+                    pass
             return
-        job = self._queue_find_job_by_id(job_id)
-        if job is None:
-            return
-        try:
-            p = Path(str(job.out_dir))
-            if p.exists():
-                open_in_explorer(p)
-        except Exception:
-            pass
+
+        # Fallback: Finished selection.
+        payload = self._finished_get_selected_payload() if hasattr(self, "_finished_get_selected_payload") else None
+        if payload:
+            self._finished_open_folder_from_payload(payload)
 
     def _queue_open_selected_job_config(self) -> None:
+        # Prefer queued/running selection.
         job_id = self._queue_get_selected_job_id()
-        if job_id is None:
+        if job_id is not None:
+            job = self._queue_find_job_by_id(job_id)
+            if job is not None:
+                try:
+                    p = Path(str(job.cfg_path))
+                    if p.exists():
+                        open_in_explorer(p.parent)
+                except Exception:
+                    pass
             return
-        job = self._queue_find_job_by_id(job_id)
-        if job is None:
+
+        # Fallback: Finished selection.
+        payload = self._finished_get_selected_payload() if hasattr(self, "_finished_get_selected_payload") else None
+        if not payload:
             return
         try:
-            p = Path(str(job.cfg_path))
-            if p.exists():
-                open_in_explorer(p.parent)
+            j = (payload.get("job", {}) or {}) if isinstance(payload, dict) else {}
+            cfg = j.get("cfg_path")
+            if cfg:
+                p = Path(str(cfg))
+                if p.exists():
+                    open_in_explorer(p.parent)
         except Exception:
             pass
 
@@ -5651,10 +5767,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _queue_pump(self, force: bool = False) -> None:
         """Start the next queued job if we're idle."""
         if self._is_running() and not force:
-            self._queue_refresh_ui(force=True)
+            self._queue_refresh_ui(force=True, refresh_details=False)
             return
         if not self._queue:
-            self._queue_refresh_ui(force=True)
+            self._queue_refresh_ui(force=True, refresh_details=False)
             return
 
         # Peek the next job. If it can't start (e.g. API server not ready), keep it queued.
@@ -5663,7 +5779,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ok:
             self._queue.pop(0)
             self._queue_save()
-        self._queue_refresh_ui(force=True)
+        self._queue_refresh_ui(force=True, refresh_details=False)
 
     def _on_generate_clicked(self) -> None:
         job = self._build_job_from_ui()
@@ -5707,9 +5823,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Snapshot outputs just before the run so we can identify what's new.
         try:
-            self._ace15_out_snapshot = {str(p.resolve()) for p in list_audio_files(job.out_dir)}
+            snap = {str(p.resolve()) for p in list_audio_files(job.out_dir)}
         except Exception:
-            self._ace15_out_snapshot = set()
+            snap = set()
+        # Pre-run snapshot is kept separate so post-run renaming doesn't destroy our diff base.
+        self._ace15_out_snapshot_pre = set(snap)
+        self._ace15_out_snapshot = set(snap)
         self._ace15_run_started_epoch = time.time()
 
         # Remember run context for post-run housekeeping.
@@ -5821,6 +5940,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._refresh_outputs()
 
+        # Add to Finished (Queue tab) on success.
+        try:
+            self._finished_add_from_active_job(exit_code=code)
+        except Exception:
+            pass
+
         # Move repo instruction.txt into the output folder so it can be reused later,
         # and to avoid the next run getting "stuck" on the previous draft.
         try:
@@ -5840,6 +5965,336 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_refresh_ui()
         # Pump immediately so it feels instant.
         self._queue_pump(force=True)
+
+    # -----------------------------
+    # Finished jobs (Queue tab)
+    # -----------------------------
+    def _ace15_collect_new_outputs(self, out_dir: Path) -> list[Path]:
+        """Best-effort: collect outputs created by the most recent run."""
+        try:
+            all_audio = list_audio_files(out_dir)
+        except Exception:
+            return []
+
+        pre = set(getattr(self, "_ace15_out_snapshot_pre", set()) or set())
+        started = float(getattr(self, "_ace15_run_started_epoch", 0.0) or 0.0)
+
+        new_files: list[Path] = []
+        if pre:
+            for p in all_audio:
+                try:
+                    if str(p.resolve()) not in pre:
+                        new_files.append(p)
+                except Exception:
+                    continue
+
+        if not new_files and started > 0:
+            for p in all_audio:
+                try:
+                    if p.stat().st_mtime >= (started - 2.0):
+                        new_files.append(p)
+                except Exception:
+                    continue
+
+        def _mtime(pp: Path) -> float:
+            try:
+                return float(pp.stat().st_mtime)
+            except Exception:
+                return 0.0
+
+        new_files = sorted(new_files, key=_mtime)
+        return new_files
+
+    def _finished_add_from_active_job(self, *, exit_code: int) -> None:
+        """Append the active job to the finished list (if successful)."""
+        if exit_code != 0:
+            return
+        job = getattr(self, "_active_job", None)
+        if job is None:
+            return
+        try:
+            out_dir = Path(str(job.out_dir))
+        except Exception:
+            return
+
+        tracks = self._ace15_collect_new_outputs(out_dir)
+        # If we can't confidently detect new files, fall back to the newest N.
+        try:
+            want = int(getattr(job, "batch_size", 1) or 1)
+        except Exception:
+            want = 1
+        if not tracks:
+            try:
+                all_audio = list_audio_files(out_dir)
+                def _mtime(pp: Path) -> float:
+                    try:
+                        return float(pp.stat().st_mtime)
+                    except Exception:
+                        return 0.0
+                tracks = sorted(all_audio, key=_mtime)[-max(want, 1):]
+            except Exception:
+                tracks = []
+
+        item = {
+            "job_id": int(getattr(job, "job_id", 0) or 0),
+            "created_epoch": float(getattr(job, "created_epoch", time.time()) or time.time()),
+            "finished_epoch": float(time.time()),
+            "title": str(getattr(job, "title", "") or ""),
+            "task_type": str(getattr(job, "task_type", "") or ""),
+            "duration_s": float(getattr(job, "duration_s", 0.0) or 0.0),
+            "batch_size": int(getattr(job, "batch_size", 1) or 1),
+            "seed": str(getattr(job, "seed", "") or ""),
+            "subgenre": str(getattr(job, "subgenre_for_naming", "") or ""),
+            "out_dir": str(out_dir),
+            "cfg_path": str(getattr(job, "cfg_path", "") or ""),
+            "tracks": [str(p) for p in tracks if p],
+        }
+
+        try:
+            self._finished_jobs.append(item)
+            self._finished_jobs = list(self._finished_jobs[-25:])
+        except Exception:
+            self._finished_jobs = [item]
+
+        try:
+            self._queue_save()
+        except Exception:
+            pass
+
+        try:
+            self._finished_refresh_ui()
+        except Exception:
+            pass
+
+    def _finished_refresh_ui(self) -> None:
+        """Rebuild the Finished jobs tree."""
+        if not hasattr(self, "tree_finished"):
+            return
+
+        tree: QtWidgets.QTreeWidget = self.tree_finished  # type: ignore[assignment]
+        tree.blockSignals(True)
+        try:
+            tree.clear()
+            jobs = list(getattr(self, "_finished_jobs", []) or [])
+            # show newest first
+            jobs = list(reversed(jobs))
+
+            for j in jobs:
+                jid = int(j.get("job_id", 0) or 0)
+                finished_epoch = float(j.get("finished_epoch", 0.0) or 0.0)
+                stamp = time.strftime("%H:%M:%S", time.localtime(finished_epoch)) if finished_epoch else ""
+                title = str(j.get("title", "") or "")
+                tracks = list(j.get("tracks", []) or [])
+                ntracks = len(tracks) if tracks else int(j.get("batch_size", 1) or 1)
+
+                parent = QtWidgets.QTreeWidgetItem(tree)
+                parent.setText(0, f"#{jid}  {stamp}  {title}")
+                parent.setText(1, str(ntracks))
+                parent.setData(0, QtCore.Qt.UserRole, {"kind": "job", "job": j})
+
+                # Child items (tracks)
+                for idx, tp in enumerate(tracks, start=1):
+                    child = QtWidgets.QTreeWidgetItem(parent)
+                    try:
+                        name = Path(tp).name
+                    except Exception:
+                        name = str(tp)
+                    child.setText(0, f"{idx}. {name}")
+                    child.setText(1, "")
+                    child.setData(0, QtCore.Qt.UserRole, {"kind": "track", "job": j, "track": tp})
+
+            try:
+                tree.expandAll()
+            except Exception:
+                pass
+        finally:
+            tree.blockSignals(False)
+
+    def _finished_get_selected_payload(self) -> Optional[dict]:
+        if not hasattr(self, "tree_finished"):
+            return None
+        tree: QtWidgets.QTreeWidget = self.tree_finished  # type: ignore[assignment]
+        items = tree.selectedItems() if tree is not None else []
+        if not items:
+            return None
+        try:
+            return items[0].data(0, QtCore.Qt.UserRole)
+        except Exception:
+            return None
+
+    def _finished_update_details_from_selection(self) -> None:
+        payload = self._finished_get_selected_payload()
+        if not payload:
+            return
+        try:
+            kind = payload.get("kind")
+            j = payload.get("job", {}) or {}
+        except Exception:
+            return
+
+        lines: list[str] = []
+        try:
+            jid = int(j.get("job_id", 0) or 0)
+            lines.append(f"Job #{jid} (finished)")
+            lines.append(f"Title: {j.get('title','')}")
+            if j.get("subgenre"):
+                lines.append(f"Subgenre: {j.get('subgenre','')}")
+            if j.get("task_type"):
+                lines.append(f"Task: {j.get('task_type','')}")
+            if j.get("duration_s"):
+                lines.append(f"Duration: {float(j.get('duration_s',0.0)):.1f}s")
+            if j.get("seed"):
+                lines.append(f"Seed: {j.get('seed','')}")
+            if j.get("out_dir"):
+                lines.append(f"Output: {j.get('out_dir','')}")
+            if j.get("cfg_path"):
+                lines.append(f"Config: {j.get('cfg_path','')}")
+            tracks = list(j.get("tracks", []) or [])
+            if tracks:
+                lines.append("")
+                lines.append("Tracks:")
+                for t in tracks:
+                    lines.append(f"  - {t}")
+        except Exception:
+            pass
+
+        if kind == "track":
+            try:
+                t = payload.get("track")
+                if t:
+                    lines.insert(1, f"Track: {t}")
+            except Exception:
+                pass
+
+        try:
+            self.ed_queue_details.setPlainText("\n".join(lines).strip() or "Select a job to see details.")
+        except Exception:
+            pass
+
+        # Clear queue selection so it's obvious which side controls the details.
+        try:
+            if hasattr(self, "tbl_queue") and self.tbl_queue is not None:
+                self.tbl_queue.blockSignals(True)
+                self.tbl_queue.clearSelection()
+                self.tbl_queue.blockSignals(False)
+        except Exception:
+            pass
+
+    def _finished_play_from_payload(self, payload: dict) -> None:
+        try:
+            kind = payload.get("kind")
+            j = payload.get("job", {}) or {}
+            track = payload.get("track")
+        except Exception:
+            return
+
+        path_s: Optional[str] = None
+        if kind == "track" and track:
+            path_s = str(track)
+        else:
+            tracks = list(j.get("tracks", []) or [])
+            if tracks:
+                path_s = str(tracks[0])
+
+        if not path_s:
+            return
+
+        try:
+            p = Path(path_s)
+            if p.exists():
+                # Play inside Create tab's preview player.
+                self._preview_load(p, autoplay=True)
+        except Exception:
+            pass
+
+    def _finished_open_folder_from_payload(self, payload: dict) -> None:
+        try:
+            j = payload.get("job", {}) or {}
+            out_dir = j.get("out_dir")
+            if out_dir:
+                p = Path(str(out_dir))
+                if p.exists():
+                    open_in_explorer(p)
+        except Exception:
+            pass
+
+    def _finished_delete_job_from_payload(self, payload: dict) -> None:
+        # Always delete the parent job (even if a track row was right-clicked).
+        try:
+            j = payload.get("job", {}) or {}
+        except Exception:
+            return
+        jid = int(j.get("job_id", 0) or 0)
+
+        # Confirm
+        try:
+            resp = QtWidgets.QMessageBox.question(
+                self,
+                "Delete finished job",
+                "Delete this finished job and its output audio files?\n\n"
+                "This will remove the entry from Finished and delete the generated track files on disk.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if resp != QtWidgets.QMessageBox.Yes:
+                return
+        except Exception:
+            return
+
+        # Delete files
+        try:
+            tracks = list(j.get("tracks", []) or [])
+            for t in tracks:
+                try:
+                    p = Path(str(t))
+                    if p.exists() and p.is_file():
+                        p.unlink()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Remove from list
+        try:
+            self._finished_jobs = [x for x in (getattr(self, "_finished_jobs", []) or []) if int(x.get("job_id", 0) or 0) != jid]
+        except Exception:
+            pass
+
+        try:
+            self._queue_save()
+        except Exception:
+            pass
+        try:
+            self._finished_refresh_ui()
+        except Exception:
+            pass
+
+    def _finished_context_menu(self, pos: QtCore.QPoint) -> None:
+        payload = None
+        try:
+            tree: QtWidgets.QTreeWidget = self.tree_finished  # type: ignore[assignment]
+            item = tree.itemAt(pos)
+            if item is not None:
+                payload = item.data(0, QtCore.Qt.UserRole)
+        except Exception:
+            payload = None
+
+        if not payload:
+            return
+
+        menu = QtWidgets.QMenu(self)
+        act_play = menu.addAction("Play")
+        act_open = menu.addAction("Open output folder")
+        menu.addSeparator()
+        act_del = menu.addAction("Delete finished job")
+
+        act = menu.exec_(QtGui.QCursor.pos())
+        if act == act_play:
+            self._finished_play_from_payload(payload)
+        elif act == act_open:
+            self._finished_open_folder_from_payload(payload)
+        elif act == act_del:
+            self._finished_delete_job_from_payload(payload)
 
     # -----------------------------
     # Output naming
