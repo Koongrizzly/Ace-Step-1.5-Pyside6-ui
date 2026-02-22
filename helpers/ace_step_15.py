@@ -1529,9 +1529,14 @@ class ApiRunner(QtCore.QObject):
                 seed_for_this_output: Optional[int] = None
                 if use_random_seed:
                     try:
-                        payload["seed"] = random.randint(0, 2**32 - 1)
+                        # Keep random seeds compact and consistent with the UI: 1..1,000,000.
+                        payload["seed"] = random.randint(1, 1_000_000)
                     except Exception:
-                        payload["seed"] = int(time.time() * 1000) & 0xFFFFFFFF
+                        # Fallback still respects the requested range.
+                        try:
+                            payload["seed"] = int((int(time.time() * 1000) % 1_000_000) + 1)
+                        except Exception:
+                            payload["seed"] = 1
                     payload["use_random_seed"] = False
                     try:
                         seed_for_this_output = int(payload.get("seed"))
@@ -2484,7 +2489,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue_last_ui_refresh = 0.0
         self._queue_ui_timer = QtCore.QTimer(self)
         self._queue_ui_timer.setInterval(5000)
-        self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=True))
+        self._queue_ui_timer.timeout.connect(lambda: self._queue_refresh_ui(force=False))
         self._queue_ui_timer.start()
         self._queue_ui_timer.start()
 
@@ -4915,10 +4920,14 @@ class MainWindow(QtWidgets.QMainWindow):
         """Generate a random seed within the UI spinbox range."""
         try:
             # Keep seeds in a compact, human-friendly range.
-            # Requested: 0 .. 1,000,000
-            return int(random.randint(0, 1_000_000))
+            # Requested: 1 .. 1,000,000
+            return int(random.randint(1, 1_000_000))
         except Exception:
-            return int(time.time()) & 0x7FFFFFFF
+            # Ensure we still stay in the requested range.
+            try:
+                return int((int(time.time() * 1000) % 1_000_000) + 1)
+            except Exception:
+                return 1
 
     def _on_seed_random_toggled(self, on: bool):
         """UI handler: enable/disable manual seed entry."""
@@ -5345,6 +5354,23 @@ class MainWindow(QtWidgets.QMainWindow):
         last = float(getattr(self, "_queue_last_ui_refresh", 0.0) or 0.0)
         allow_full = force or (now - last) >= 5.0
 
+        # UX: Pause auto-refresh while the user has a row selected, so the details pane doesn't get cleared.
+        # (Manual actions like right-click still work; refresh resumes when selection is cleared.)
+        try:
+            sm = self.tbl_queue.selectionModel()
+            user_has_selection = bool(sm and sm.hasSelection())
+            if not user_has_selection:
+                rr = int(self.tbl_queue.currentRow())
+                user_has_selection = (rr >= 0 and self.tbl_queue.currentItem() is not None and bool(self.tbl_queue.hasFocus()))
+        except Exception:
+            user_has_selection = False
+        if (not force) and user_has_selection:
+            try:
+                self._update_api_change_locks()
+            except Exception:
+                pass
+            return
+
         # Remember current selection (by job_id) so we can restore it after refresh.
         selected_job_id: Optional[int] = None
         try:
@@ -5356,6 +5382,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     selected_job_id = it.data(QtCore.Qt.UserRole)
         except Exception:
             selected_job_id = None
+        # If selection was already cleared (e.g. during a refresh tick), fall back to the last remembered job id.
+        if selected_job_id is None:
+            try:
+                selected_job_id = getattr(self, "_queue_last_selected_job_id", None)
+            except Exception:
+                selected_job_id = None
         try:
             is_running = self._active_job is not None
             qn = len(self._queue)
@@ -5472,7 +5504,23 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             sel = self.tbl_queue.selectionModel().selectedRows()
             if not sel:
-                return None
+                # If the user clicked a cell (current row) but row-selection is not active, selectedRows() can be empty.
+                try:
+                    rr = int(self.tbl_queue.currentRow())
+                    if rr >= 0:
+                        it0 = self.tbl_queue.item(rr, 0)
+                        if it0 is not None:
+                            v0 = it0.data(QtCore.Qt.UserRole)
+                            if v0 is not None:
+                                return int(v0)
+                except Exception:
+                    pass
+                # Table refreshes can momentarily drop selection; keep the last remembered selection.
+                try:
+                    v = getattr(self, "_queue_last_selected_job_id", None)
+                    return int(v) if v is not None else None
+                except Exception:
+                    return None
             r = int(sel[0].row())
             it = self.tbl_queue.item(r, 0)
             if it is None:
@@ -5598,6 +5646,38 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         job_id = self._queue_get_selected_job_id()
+        # Remember the last selected job so details don't vanish on periodic refresh.
+        if job_id is not None:
+            try:
+                self._queue_last_selected_job_id = int(job_id)
+            except Exception:
+                pass
+        else:
+            # Sometimes a refresh temporarily clears selection; try to restore it to the last remembered row.
+            try:
+                last_id = getattr(self, "_queue_last_selected_job_id", None)
+            except Exception:
+                last_id = None
+            if last_id is not None and not bool(getattr(self, "_queue_restoring_selection", False)):
+                try:
+                    self._queue_restoring_selection = True
+                    for rr in range(self.tbl_queue.rowCount()):
+                        it0 = self.tbl_queue.item(rr, 0)
+                        if it0 is not None and it0.data(QtCore.Qt.UserRole) == int(last_id):
+                            try:
+                                self.tbl_queue.selectRow(rr)
+                                self.tbl_queue.setCurrentCell(rr, 0)
+                            except Exception:
+                                pass
+                            break
+                    job_id = self._queue_get_selected_job_id()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self._queue_restoring_selection = False
+                    except Exception:
+                        pass
         if job_id is None:
             # During a table rebuild, selection can temporarily clear; don't overwrite the details pane.
             try:
