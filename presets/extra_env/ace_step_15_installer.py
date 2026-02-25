@@ -109,7 +109,8 @@ def patch_ace_pyproject_windows_compat(repo_dir: Path) -> None:
 
     Fixes:
     - Remove nano-vllm dependency (pulls official triton>=3 and other deps that break pip on Windows).
-    - Remove gradio / fastapi (not required for FrameVision headless subprocess runner).
+    - Remove gradio (not required for FrameVision).
+      NOTE: fastapi IS required for FrameVision's generated headless API server.
     - Remove strict torch pin like 'torch==2.7.1+cu128; sys_platform == "win32"' so it won't fight our pinned Torch.
     We install our Torch stack explicitly (cu128) before installing ACE-Step.
     """
@@ -121,7 +122,8 @@ def patch_ace_pyproject_windows_compat(repo_dir: Path) -> None:
     original = s
 
     # Drop specific problematic deps
-    for dep in ("nano-vllm", "gradio", "fastapi"):
+    # Keep fastapi: the generated headless API server imports it.
+    for dep in ("nano-vllm", "gradio"):
         s = re.sub(r'\n\s*"' + re.escape(dep) + r'[^"]*"\s*,?\s*', "\n", s)
 
     # Drop strict torch/vision/audio pins with CUDA local version markers
@@ -138,7 +140,7 @@ def patch_ace_pyproject_windows_compat(repo_dir: Path) -> None:
 
     if s != original:
         pyproject.write_text(s, encoding="utf-8")
-        log("[PATCH] Patched ACE-Step pyproject.toml (Windows): removed nano-vllm/gradio/fastapi and torch+cu pins.")
+        log("[PATCH] Patched ACE-Step pyproject.toml (Windows): removed nano-vllm/gradio and torch+cu pins (kept fastapi).")
 
 def ensure_nano_vllm(root: Path, vpip: list[str], env: dict[str, str]) -> None:
     """
@@ -290,14 +292,15 @@ def main() -> int:
     run(vpip + ["install", "torchsde"], env=env)
     run(vpip + ["install", f"triton-windows<3.5"], env=env)
 
+    # ACE-Step install (single, deterministic attempt).
+    # Older revisions retried by re-installing Torch, but we already pin+install Torch above.
     log("[STEP] Installing ACE-Step (pip, editable)...")
-    try:
-        run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU128, "-e", "."], cwd=repo_dir, env=env)
-    except Exception:
-        log("[WARN] Editable install failed. Trying to install torch CUDA stack first, then retry...")
-        # best-effort torch install (cu128 index)
-        run(vpip + ["install", "--index-url", TORCH_INDEX_CU128, "torch", "torchvision", "torchaudio"], env=env)
-        run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU128, "-e", "."], cwd=repo_dir, env=env)
+    run(vpip + ["install", "--extra-index-url", TORCH_INDEX_CU128, "-e", "."], cwd=repo_dir, env=env)
+
+    # FrameVision generates a headless API server that imports FastAPI.
+    # Some ACE-Step installs omit it (or we patch the pyproject), so ensure it explicitly.
+    log("[STEP] Ensuring FastAPI runtime (fastapi + uvicorn)...")
+    run(vpip + ["install", "--upgrade", "fastapi", "uvicorn"], env=env)
 
     # 4b) Stabilize Diffusers/TorchAO on Windows.
     # Recent Diffusers releases introduced a TorchAO quantizer import path that can crash at import-time
@@ -340,7 +343,7 @@ def main() -> int:
     log("[STEP] Headless verification (no Gradio)...")
     verify(root, vpy, env)
 
-    # 7) nano-vllm local package bundled inside ACE-Step repo (required for vLLM backend on Windows)
+    # 7) nano-vllm local package bundled inside ACE-Step repo (used by vLLM backend on Windows)
     nano_vllm_local = root / "models" / "ace_step_15" / "repo" / "ACE-Step-1.5" / "acestep" / "third_parts" / "nano-vllm"
     if nano_vllm_local.exists():
         log(f"[STEP] Installing bundled nano-vllm from: {nano_vllm_local}")
@@ -353,13 +356,7 @@ def main() -> int:
         log("[STEP] Installing FlashAttention wheel (Windows, cu128/torch2.9, installed last)...")
         run(vpip + ["install", FLASH_ATTN_WHEEL_URL], env=env)
 
-        # 8) nano-vllm local package bundled inside ACE-Step repo (required for vLLM backend on Windows)
-#        nano_vllm_local = root / "models" / "ace_step_15" / "repo" / "ACE-Step-1.5" / "acestep" / "third_parts" / "nano-vllm"
-#        if nano_vllm_local.exists():
-#            log(f"[STEP] Installing bundled nano-vllm from: {nano_vllm_local}")
-#            run(vpip + ["install", "."], cwd=nano_vllm_local, env=env)
-#        else:
-#            log(f"[WARN] Bundled nano-vllm folder not found (skipping): {nano_vllm_local}")
+        # (nano-vllm is installed once above; keep FlashAttention as the final step.)
 
     log("\n[OK] ACE-Step 1.5 install complete.")
     return 0
