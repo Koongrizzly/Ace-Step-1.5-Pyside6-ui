@@ -38,13 +38,12 @@ How to add a preset ? It wll first ask for the main genre (eg 'Rock', next it as
 - logger
 - Online updater
 - Queue for unlimited generations with cancel running / remove from queue, still keeps selection 1-4 (or 8 with some models) as 1 job. Queue has mmemory to continue after restart app
-- System hud on/off depending on your hardware it will show all kinds of info (tume/date/gpu/cpu/ddr/up-download speed
+- System hud on/off : depending on your hardware it will show all kinds of info (tume/date/gpu/cpu/ddr/up-download speed
 
 ---
 
 ## 🚫 Not working/not installed
-- Flash
-- nano-vllm (fallback to Pytorch)
+
 - tell me what else is not working.
 
 ---
